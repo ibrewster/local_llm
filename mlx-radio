@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+
+PLIST="$HOME/Library/LaunchAgents/com.brewstersoft.mlx-radio.plist"
+
+case "${1:-}" in
+    start)
+        launchctl load "$PLIST"
+        ;;
+    stop)
+        launchctl unload "$PLIST"
+        ;;
+	disable)
+        launchctl unload -w "$PLIST"
+        ;;
+    enable)
+        launchctl load -w "$PLIST"
+        ;;
+    restart)
+        launchctl unload "$PLIST"
+        launchctl load "$PLIST"
+        ;;
+    *)
+        echo "usage: $(basename "$0") {start|stop|restart}"
+        exit 1
+        ;;
+esac

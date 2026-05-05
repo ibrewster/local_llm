@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" 
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Unique label -->
+    <key>Label</key>
+    <string>com.hermes.audio_streamer</string>
+
+    <!-- Path to the app executable inside the .app bundle -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/israel/Development/tts_pipeline/audio_streamer.app/Contents/MacOS/audio_streamer</string>
+    </array>
+
+    <!-- Run automatically at load -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it exits -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Optional: logs -->
+    <key>StandardOutPath</key>
+    <string>/var/log/tts/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/tts/server.log</string>
+
+    <!-- Launch headless, no terminal -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
