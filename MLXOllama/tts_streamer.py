@@ -28,8 +28,14 @@ class TTSStreamer():
             while True:
                 msg = self._queue.get()
                 ###### DEBUG REMOVE ######
-                logging.info(f"{msg[0]}")
-                continue
+                # if not isinstance(msg, (tuple, list)):
+                    # msg = (msg, )
+
+                # try:
+                    # logging.info(f"{msg[0]}")
+                # except Exception as e:
+                    # logging.info(str(msg))
+                # continue
             ###########################
                 if msg == "__FLUSH__":
                     self._packetizer.flush()
