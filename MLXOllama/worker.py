@@ -11,15 +11,95 @@ import random
 import re
 import traceback
 
-from pathlib import Path
-
-import numpy
-
 from mlx_lm import generate, stream_generate, sample_utils
 import mlx.core as mx
 
 from . import utils, config, local_tools, tts_queue
 from .cache_utils import get_cache
+
+
+alaskan_content = {
+    "Alaskan Lifestyle Object": [
+        ("Ulu", "a curved knife with a caribou antler handle used for subsistence"),
+        ("Totem Pole", "a tall cedar monument carved with ancestral figures"),
+        ("Birchbark Canoe", "a lightweight traditional Athabascan river vessel"),
+        ("Lever-action Rifle", "a rugged firearm used for hunting and protection in the bush"),
+        ("Atkuk", "a heavy sea-otter fur parka built for extreme arctic cold"),
+        ("Mukluks", "traditional boots made of sealskin and decorated with beadwork"),
+        ("Walrus Harpoon", "a historical hunting tool with a hand-carved ivory tip"),
+        ("Baleen Basket", "a rare vessel woven from whale baleen with an ivory finial"),
+        ("Bentwood Visor", "a wooden hunting hat carved to shield the eyes from sea glare"),
+        ("Qiviut Scarf", "a garment made from the incredibly soft underwool of the musk ox"),
+        ("Kuspuk", "a hooded Alaskan overshirt, often with a bright floral pattern"),
+        ("Berry Basket", "a sturdy container made of woven birch bark for harvesting"),
+        ("Gutskin Parka", "a traditional waterproof raincoat made from seal or bear intestines"),
+        ("Moose-hide Mittens", "heavy winter gloves tanned from moose skin and beaded"),
+        ("Dog Sled", "a wooden transport frame with ash runners for winter travel"),
+        ("Soapstone Carving", "a heavy stone sculpture of a breaching whale or arctic animal"),
+        ("Tlingit Bracelet", "a silver cuff carved with raven, eagle, or wolf crests"),
+        ("Halibut Hook", "a large V-shaped hook carved from cedar and yew wood"),
+        ("Dentalium Necklace", "jewelry made from white tusk-shaped sea shells"),
+        ("Cradleboard", "a traditional wooden frame for carrying an infant on the back"),
+        ("Snow Goggles", "walrus ivory with narrow slits to prevent snow blindness"),
+        ("Spruce-root Hat", "a finely woven conical hat used in the rainy coastal regions"),
+        ("Tináa", "a Tlingit ceremonial copper shield representing high status"),
+        ("Taliq", "strips of dried, smoked salmon used as a staple food"),
+        ("Qayaq", "a traditional driftwood-frame skin boat for maritime hunting"),
+        ("Snowshoes", "large wooden frames with rawhide webbing for walking on deep drifts"),
+        ("Devil's Club Salve", "a medicinal ointment made from the bark of a thorny tundra plant"),
+        ("Spirit Mask", "a ceremonial whalebone mask adorned with raven feathers"),
+        ("Oosik", "a polished and often carved walrus baculum bone"),
+        ("Xtratuf Boots", "neoprene boots known as the unofficial footwear of coastal Alaska"),
+        ("Labret", "a traditional lip ornament made of polished stone or bone"),
+        ("Birch Syrup", "a sweet, earthy syrup tapped from local birch trees"),
+        ("Salmon-skin Sewing Kit", "a pouch made of dried fish leather used for needlework"),
+        ("Quillwork Vest", "a garment decorated with dyed porcupine quills"),
+        ("Caribou Sleeping Mat", "a warm, thick hide used for bedding in winter camps"),
+        ("Button Blanket", "a ceremonial wool robe decorated with mother-of-pearl buttons"),
+        ("Cribbage Board", "a folk-art game board carved from a walrus ivory tusk"),
+        ("Gold Nugget Pendant", "jewelry featuring raw gold found in Alaskan rivers"),
+        ("Hudson Bay Tea", "dried leaves of the Labrador Tea plant used for brewing"),
+        ("Baleen Tool", "a specialized scraper used for working with whale baleen"),
+        ("Moose-antler Rack", "a functional wall hanger made from shed moose antlers"),
+        ("Inupiaq Yo-yo", "two sealskin balls on a string used for traditional games"),
+        ("Qulliq", "a traditional semi-circular stone oil lamp for heat and light"),
+        ("Dance Fan", "a feathered or fur-trimmed fan used in traditional dancing"),
+        ("Sinew Thread", "strong, traditional cordage made from animal tendons"),
+        ("Fireweed Clip", "a modern hair accessory modeled after the purple tundra flower"),
+        ("Fox Tail Hat", "a warm winter hat featuring a long arctic fox tail"),
+        ("Lichen-dyed Blanket", "a wool blanket colored with dyes made from tundra moss"),
+        ("Copper Earrings", "hand-hammered jewelry reflecting ancient metalworking"),
+        ("Float Plane Model", "a miniature de Havilland Beaver or bush plane")
+    ],
+    "Alaskan Animals": [
+        ("Grizzly Bear", "a massive brown bear often found fishing for salmon"),
+        ("Grey Wolf", "a social apex predator that hunts in the vast wilderness"),
+        ("Moose", "the largest member of the deer family with massive palmate antlers"),
+        ("Bald Eagle", "a white-headed bird of prey common along the coast"),
+        ("Orca", "the black-and-white 'killer whale' found in Alaskan fjords"),
+        ("Caribou", "the arctic deer known for long-distance migrations"),
+        ("Lynx", "a silent feline with tufted ears and large paws for snow"),
+        ("Humpback Whale", "a massive marine mammal known for breaching and singing"),
+        ("Dall Sheep", "a white, thin-horned sheep found on high mountain ridges"),
+        ("Wolverine", "a small but incredibly fierce and solitary forest predator"),
+        ("Musk Ox", "a prehistoric-looking herbivore with long, shaggy hair"),
+        ("Sea Otter", "a furry marine mammal that floats on its back in kelp forests"),
+        ("Puffin", "a colorful sea bird with a bright orange beak"),
+        ("Walrus", "a heavy marine mammal with long ivory tusks"),
+        ("Arctic Fox", "a small fox whose coat turns white in the winter"),
+        ("Steller Sea Lion", "a massive, roaring pinniped found on rocky haul-outs"),
+        ("Snowshoe Hare", "a rabbit whose fur changes color with the seasons"),
+        ("Ptarmigan", "the state bird of Alaska, known for its feathered feet"),
+        ("Beluga Whale", "a small, white whale found in the Cook Inlet"),
+        ("Porpoise", "a fast-swimming black and white marine mammal"),
+        ("Marmot", "a large ground squirrel found in rocky alpine areas"),
+        ("Sitka Black-tailed Deer", "a small deer native to the rainforests of Southeast"),
+        ("Mountain Goat", "a sure-footed white climber of the steep coastal peaks"),
+        ("Harbor Seal", "a common, spotted seal often seen resting on ice floes"),
+        ("Porcupine", "a slow-moving rodent covered in sharp defensive quills")
+    ]
+}
+
 
 
 def gen_goodnight(prompt):
@@ -29,60 +109,50 @@ def gen_goodnight(prompt):
 
     current_month = datetime.datetime.now().strftime("%B")
     day_of_year = datetime.datetime.now().timetuple().tm_yday
-    item_pick = random.randint(1, 50)
-    
-    system_instruction = (
-        f"You are a Fairbanks, Alaska storyteller. It is currently {current_month}. "
-        'Write a gentle, short, 2-stanza rhythmic bedtime poem using AABB or AABBCC rhyme schemes in the style of "Goodnight Moon" or other bedtime stories'
-        "Vary the style depending on the day of the year. "
-        "Pick an item from the specified special object category in this manner:"
-        "  - mentally generate a list of 50 unique, plausible items within that category. Rank these 50 items based on their cultural iconic status and thematic intensity. "
-        "  - IF the category is Alaskan Lifestyle Object, avoid highly specialized, scientific, or industrial items that you would not find in a normal or traditional Alaskan house. Instead, Prioritize Alaska Native items like ulus, totem poles, various native garments, etc. "
-        "  - Treat the provided 50-sided die result as the index for that list. Select the item located at that exact index. "
-        "Use this item naturally somewhere in the poem. "
 
-        f"- Use Fairbanks imagery for {current_month}. " 
-        "- Weave in the specific Low and High temperatures and the weather conditions for tomorrow naturally. "
-        "- ONLY mention the Aurora if the user explicitly states an alert is active."
-        "- Use the day of the week tomorrow to further color the tone (e.g., Friday's look toward the weekend). "
-        "- End the second stanza with a quiet, local Fairbanks closing thought. "
-        "NO MARKDOWN. CLEAN TEXT ONLY. "
-    )
-    
-    special_items = ["Alaskan Animal", "Alaskan Lifestyle Object"]
-    special_item = random.choice(special_items)
-    random_info = f"\n--- MAPPING DATA ---\n50-sided die (Item Index): {item_pick}\nSpecial Object Category: {special_item}.\nThe day of the year is: {day_of_year}\n-------------------"
-    
+    category_pick = random.choice(list(alaskan_content.keys()))
+    item_pick, item_description = random.choice(alaskan_content[category_pick])
+
+
+    dynamic_info = f"""
+### INPUT DATA
+SPECIAL_ITEM = {item_pick}
+ITEM_DESCRIPTION = {item_description}
+The day of the year is: {day_of_year}
+CURRENT_MONTH = {current_month}
+-------------------"""
+
     message = [
-        {"role": "system","content": system_instruction,}, 
-        {"role": "user","content": prompt + random_info,}
+        {"role": "system","content": "###BEDTIME###",},
+        {"role": "user","content": prompt + dynamic_info,}
     ]
-    
-    
+
+
     mod_info = utils.loaded_models[config.MAIN_MODEL]
     model = mod_info['model']
     tokenizer = mod_info['tokenizer']
-    
-    cache, _ = asyncio.run(get_cache(mod_info, message, None, is_static=True))
+
+    cache, _ = asyncio.run(get_cache(mod_info, message, None))
     if cache:
         cache = copy.copy(cache)
         message = message[1:]
-    
+
     sampler = sample_utils.make_sampler(
         temp=0.95,
         top_p=0.92
     )
-    
+
     formatted_prompt = tokenizer.apply_chat_template(
         message,
         tokenize=False,
         add_generation_prompt=True,
         enable_thinking=False
     )
-    
-    response = ""
-    sentences = []
-    first_sentence = None
+
+    remainder = ""
+    body_sentences = []
+    sentence_index = 0
+    first_sentence = -1
     with utils.mlx_inference_lock:
         mx.random.seed(int(time.time()))
         for token in stream_generate(
@@ -92,105 +162,99 @@ def gen_goodnight(prompt):
             prompt_cache=cache,
             sampler=sampler
         ):
-            response += token.text
-            if '\n' in response:
-                portions = response.split('\n')
-                
-                if first_sentence is None:
+            remainder += token.text
+            if '\n' in remainder:
+                head, *tail = remainder.split('\n')
+
+                if sentence_index == 0:
                     first_sentence = time.time() - t0
-                    tts_queue.put((portions[0].strip(), 0.8, 'af_bella'))
-                    
-                sentences.append(portions[0])
-                if len(portions) > 1:
-                    response = "\n".join(portions[1:])
+                if sentence_index < 2:
+                    tts_queue.put((head.strip(), 0.8, 'af_bella'))
                 else:
-                    response = ""
-            
-        if response.strip():
-            sentences.append(response)
-            tts_queue.put((" ".join(sentences[1:]), 0.8, 'af_bella'))
-    
+                    body_sentences.append(head)
+                sentence_index += 1
+
+                remainder = "\n".join(tail) # Handles empty automatically
+
+        if remainder.strip():
+            body_sentences.append(remainder)
+            body_text = "\n".join(body_sentences)
+            body_text = re.sub(r'(?<!\n)\n(?!\n)', ' ', body_text)
+            tts_queue.put((body_text, 0.8, 'af_bella'))
+
     tts_queue.put("__FLUSH__")
-    
-    response = "\n".join(sentences)
-    # Remove any "gemma" tags
-    response = re.sub(r'<\|[^>]+>.*?<[^>]+?\|>', '', response, flags=re.DOTALL)
-    
+
     logging.info(f"Got goodnight text in {time.time() - t0}. First sentence in {first_sentence}")
-    
-    out_dir: Path = Path(__file__).parent / "GenOut"
-    out_dir.mkdir(exist_ok=True)
-        
-    with open(out_dir / "goodnight.txt", 'w') as f:
-        f.write(response)
-    
+
     return
-        
+
 def speak_thread(speak_queue):
     logging.info("Listening for prompts")
     mod_info = utils.loaded_models[config.MAIN_MODEL]
     model = mod_info['model']
     tokenizer = mod_info['tokenizer']
-        
+
     while True:
         mx.clear_cache()
         gc.collect()
-        mx.clear_cache()         
+        mx.clear_cache()
         try:
-            msg = speak_queue.get(timeout=660) # 11 minutes
+            msg = speak_queue.get(timeout=300) # 5 minutes
         except queue.Empty:
             run_dummy_inference()
             continue
-        
+
         if isinstance(msg, tuple):
             system, prompt = msg
         else:
             system: str = None
             prompt: str = msg
-        
+
         if prompt == "QUIT":
             break
         if prompt == "UPDATE":
-            time.sleep(1)
             run_dummy_inference()
             continue
-        
+
         ############ Bedtime Message ###################
         if prompt.startswith("It is bedtime"):
             gen_goodnight(prompt)
             continue
         ################################################
-        
+
+
         t1=time.time()
         use_thinking = prompt.startswith("/think")
         clean_prompt = prompt.replace("/think", "").strip()
+
+
         message = [
             {"role": "user","content": clean_prompt,}
         ]
-        
+
         cache = None
         if system:
             message = [
                 {"role": "system","content": system}
             ] + message
-            
-            cache, _ = asyncio.run(get_cache(mod_info, message, None, is_static=True))
+
+            cache, _ = asyncio.run(get_cache(mod_info, message, None))
             if cache:
                 cache = copy.copy(cache)
                 message = message[1:]
-            
+
         formatted_prompt = tokenizer.apply_chat_template(
             message,
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=use_thinking
         )
-        
+
         try:
             with utils.mlx_inference_lock:
                 buffer = ""
                 mx.random.seed(int(time.time_ns() % 2**32))
-                
+
                 stream = stream_generate(
                     model,
                     tokenizer,
@@ -198,86 +262,86 @@ def speak_thread(speak_queue):
                     sampler=utils.FUN_SAMPLER,
                     max_kv_size=2048,
                     max_tokens=4096,
-                    prefill_step_size=6144, 
+                    prefill_step_size=6144,
                     prompt_cache=cache
                 )
-                
+
                 is_thinking = False
                 sentence_count = 0
                 for chunk in stream:
                     token_text = chunk.text
-                    
+
                     # Check for state changes
                     if "<think>" in token_text or '<channel|>' in token_text:
                         is_thinking = True
                         # Strip the tag itself if it's bundled with other text
                         token_text = token_text.replace("<think>", "")
                         token_text = token_text.replacte('<channel|>', "")
-                        
+
                     if "</think>" in token_text or '<|channel>' in token_text:
                         is_thinking = False
                         # Strip the tag and continue—only text AFTER this is the 'answer'
                         token_text = token_text.split("<|channel>")[-1]
                         if not token_text:
                             continue
-                
+
                     # If the model is currently 'thinking', skip sending to buffer/TTS
                     if is_thinking:
                         continue
-                        
+
                     content = token_text
                     if not content:
                         continue
                     buffer += content
-                    
+
                     pattern = utils.sentence_endings_conservative if sentence_count < 2 else utils.paragraph_split
                     matches = list(pattern.finditer(buffer))
-                    
+
                     if matches:
                         last_match = matches[-1]
                         split_point = last_match.end()
-                        
+
                         complete = buffer[:split_point]
                         buffer = buffer[split_point:]
-                        
+
                         if sentence_count == 0:
                             logging.info(f"Mode: {'Reasoning' if use_thinking else 'Instant'}")
                             logging.info(f"Time to first sentence: {time.time()-t1}")
                         sentence_count += 1
                         logging.debug(complete.strip())
                         tts_queue.put(complete.strip())
-        
+
             # Flush remaining text
             if buffer:
                 tts_queue.put(buffer)
         finally:
             tts_queue.put("__FLUSH__")
             logging.info(f"Completed inference in {time.time() - t1}")
-            
+
     logging.info("Prompt processing thread exited")
-    
+
 def run_dummy_inference():
-    """Run the fastest possible inference, just to keep things alive/in ram"""    
+    """Run the fastest possible inference, just to keep things alive/in ram"""
     for mod_name, mod_info in utils.loaded_models.items():
         model = mod_info['model']
         tokenizer = mod_info['tokenizer']
-        
+
         t1 = time.time()
         message = [{"role": "user", "content": "Hi"}]
-    
+
         formatted = tokenizer.apply_chat_template(
             message,
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False
         )
-    
+
         sampler = sample_utils.make_sampler(
             temp=0.0,
             top_p=1.0,
         )
-    
-        with utils.mlx_inference_lock:            
+
+        with utils.mlx_inference_lock:
             _ = generate(
                 model,
                 tokenizer,
@@ -286,8 +350,8 @@ def run_dummy_inference():
                 max_tokens=1
             )
         logging.info(f"Ran keep-alive inference for {mod_name} in {time.time() - t1}")
-   
-            
+
+
 async def _stream_tokens(
     model_info: dict, msg_history: str,
     options: dict, state: dict=None,
@@ -304,7 +368,7 @@ async def _stream_tokens(
     try:
         model = model_info['model']
         tokenizer = model_info['tokenizer']
-        
+
         cache, is_ha = await get_cache(model_info, msg_history, tools)
         if cache:
             cache = copy.copy(cache)
@@ -320,7 +384,7 @@ async def _stream_tokens(
             options['max_tokens'] = 256
 
         sampler = sample_utils.make_sampler(
-            temp=options.get("temp", 0.65), 
+            temp=options.get("temp", 0.65),
             min_p=0.05,
             xtc_probability=0.5,
             xtc_threshold=0.1
@@ -328,29 +392,29 @@ async def _stream_tokens(
 
         formatted_prompt = tokenizer.apply_chat_template(
             msg_history,
-            tools=tools, 
+            tools=tools,
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=think
         )
-        
+
         if formatted_prompt.strip().endswith("<think>"):
             yield "<think>\n", False, None
-            
+
         if "<|channel>" in formatted_prompt:
             yield "<|channel>" + formatted_prompt.rsplit("<|channel>")[1], False, None
-        
+
         suffix_tokens = tokenizer.encode(formatted_prompt)
         logging.info(f"{len(suffix_tokens)} Tokens encoded")
-        
+
         available_space = 262144 - len(suffix_tokens) - 100
         safe_max = min(options.get("max_tokens", 64000), available_space)
-        
+
         full_output_tokens = []
-        
+
         token_queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
-        
+
         def thread_worker():
             try:
                 with utils.mlx_inference_lock:
@@ -361,11 +425,11 @@ async def _stream_tokens(
                         prompt=suffix_tokens,
                         max_tokens=safe_max,
                         sampler=sampler,
-                        prompt_cache=cache         
+                        prompt_cache=cache
                     ):
                         loop.call_soon_threadsafe(
                             token_queue.put_nowait,
-                            (response.text, response.token, False, None) 
+                            (response.text, response.token, False, None)
                         )
                 loop.call_soon_threadsafe(
                     token_queue.put_nowait, ("", None, True, None)
@@ -373,15 +437,15 @@ async def _stream_tokens(
 
             except Exception as e:
                 loop.call_soon_threadsafe(queue.put_nowait, (None, None, True, e))
-                
+
         thread = threading.Thread(target=thread_worker, daemon=True)
         thread.start()
-        
+
         while True:
             result = await token_queue.get()
-        
+
             text, token,is_done, err = result
-            
+
             if isinstance(err, Exception):
                 # Optional: yield partial + log, then re-raise or swallow
                 logging.error(f"Inference error: {err}")
@@ -389,7 +453,7 @@ async def _stream_tokens(
                 break
             if is_done:
                 break
-            
+
             eval_count += 1
             full_output_tokens.append(token)
             yield text, False, None
@@ -400,21 +464,21 @@ async def _stream_tokens(
         logging.error(f"Unable to generate output ({e})")
         state['context'] = None
         state['eval_count'] = 0
-        
+
     elapsed = time.time_ns() - t0
     yield "", True, {"eval_count": eval_count, "eval_duration": elapsed}
-    
+
 async def generate_stream(stream, model_info, msg_history, options,
                           is_gen=False, tools=None, think=False):
     t1 = time.time_ns()
-    
+
     for msg in msg_history:
         if not "content" in msg:
             msg["content"] = ""
-    
+
     model_name = model_info.get("name", config.QUICK_MODEL)
-    
-    if stream:            
+
+    if stream:
         if utils.cache_lock.locked():
             yield json.dumps({
                 "message": {
@@ -424,21 +488,21 @@ async def generate_stream(stream, model_info, msg_history, options,
                 },
                 "done": False,
             }) + "\n"
-            
+
             async with utils.cache_lock:
                 pass
-        
-    
+
+
     for iteration in range(config.MAX_TOOL_CALLS):
         t2 = time.time()
         full_text = ""
         stats = {}
-        state = {}    
-        tool_call_detected = False    
+        state = {}
+        tool_call_detected = False
         buffer = ""
         unicode_buf = ""
         first_token = True
-        
+
         async for token, done, stats in _stream_tokens(
             model_info, msg_history, options, state, tools=tools, think=think
         ):
@@ -449,7 +513,7 @@ async def generate_stream(stream, model_info, msg_history, options,
                     unicode_buf = ""
                 else:
                     continue
-                
+
             if first_token:
                 first_token = False
                 if "thought" in token and not "<|channel>" in token:
@@ -457,10 +521,10 @@ async def generate_stream(stream, model_info, msg_history, options,
                     token = "<|channel>" + token
 
             full_text += token
-            
+
             if tool_call_detected:
                 continue
-            
+
             # See if we have a tool call. If so, stop streaming and accumulate tool calls
             if buffer or "<" in token:
                 buffer += token
@@ -471,17 +535,17 @@ async def generate_stream(stream, model_info, msg_history, options,
 
                     # Clean up Gemma 4 output
                     elif "<channel|>" in buffer:
-                        buffer = re.sub(r'(<\|channel>.*?)?<channel\|>', '', buffer, flags=re.DOTALL)    
+                        buffer = re.sub(r'(<\|channel>.*?)?<channel\|>', '', buffer, flags=re.DOTALL)
                         token = buffer
                         buffer = ""
                     elif "<|channel>" in buffer:
-                        continue                        
+                        continue
                     else:
                         token = buffer
                         buffer = ""
                 else:
                     continue  # still accumulating, don't stream yet
-            
+
             if not tool_call_detected and stream: # and not done:
                 chunk = {
                     "model": model_name,
@@ -491,20 +555,20 @@ async def generate_stream(stream, model_info, msg_history, options,
                     chunk["response"] = token
                 else:
                     chunk['message'] =  {"role": "assistant", "content": token}
-    
+
                 line = json.dumps(chunk) + "\n"
                 yield line
-    
+
         logging.info(f"Generated response in {time.time() - t2}")
         logging.info(f"Raw Response: {full_text}")
-        
+
         tool_calls,cleaned_text = utils.parse_tool_calls(full_text)
-        
+
         if not tool_calls or is_gen:
             break
 
         executed_msgs, remaining_calls = await try_server_tools(tool_calls)
-            
+
         if remaining_calls:
             # Forward only what's left
             done = False if executed_msgs else True
@@ -520,17 +584,17 @@ async def generate_stream(stream, model_info, msg_history, options,
             }
             if done:
                 msg["done_reason"] = "tool_call"
-                
+
             yield json.dumps(msg) + "\n"
-                
+
         if executed_msgs:
             msg_history.append({
                 "role": "assistant",
                 "content": cleaned_text or "",
                 "tool_calls": tool_calls,
-            })            
+            })
             msg_history.extend(executed_msgs)
-            
+
             if iteration == config.MAX_TOOL_CALLS - 1:
                 logging.warning(f"Tool call limit of {config.MAX_TOOL_CALLS} reached")
                 msg_history.append({
@@ -541,11 +605,11 @@ async def generate_stream(stream, model_info, msg_history, options,
                         "If the information is incomplete, acknowledge that clearly in your response."
                     )
                 })
-                
+
         else:
             break
-        
-        
+
+
     total_time = time.time_ns() - t1
     stats_fields = {
         "model": model_name,
@@ -558,8 +622,8 @@ async def generate_stream(stream, model_info, msg_history, options,
         "prompt_eval_duration": 0,
         "total_duration": int(total_time),
         "load_duration": 0,
-    }    
-    assistant_resp = {"role": "assistant", "content": full_text}    
+    }
+    assistant_resp = {"role": "assistant", "content": full_text}
     if is_gen:
         msg_history.append(assistant_resp)
         new_key = hash(tuple(state['context']))
@@ -587,7 +651,7 @@ async def try_server_tools(tool_calls: list) -> tuple[list[dict], list[dict]]:
     """
     executed = []
     to_forward = []
-    server_tools = utils.MCP_CLIENT.available_tools | local_tools.LOCAL_TOOLS.keys() 
+    server_tools = utils.MCP_CLIENT.available_tools | local_tools.LOCAL_TOOLS.keys()
     for tc in tool_calls:
         fn = tc.get("function", {})
         tool_name = fn.get("name")
@@ -597,7 +661,7 @@ async def try_server_tools(tool_calls: list) -> tuple[list[dict], list[dict]]:
         if tool_name not in server_tools:
             to_forward.append(tc)
             continue
-        
+
         if tool_name in local_tools.LOCAL_TOOLS:
             try:
                 func = getattr(local_tools, tool_name)
@@ -618,16 +682,16 @@ async def try_server_tools(tool_calls: list) -> tuple[list[dict], list[dict]]:
                     if hasattr(block, "text")
                 )
                 exec_success = True
-                
+
                 if result.is_error:
-                    # do NOT set exc_success to False here - the tool 
+                    # do NOT set exc_success to False here - the tool
                     # *did* run, it just returned an error result.
                     logging.error(f"Tool {tool_name} returned error: {tool_result_content}")
-                    
+
             except Exception as e:
                 # Can't handle locally. Fall back to sending to the caller.
                 logging.error(f"MCP tool call failed: {e}")
-                
+
         if exec_success:
             executed.append({
                 "role": "tool",
@@ -638,5 +702,5 @@ async def try_server_tools(tool_calls: list) -> tuple[list[dict], list[dict]]:
         else:
             # Either never got a result, or got an error from MCP
             to_forward.append(tc)
-            
+
     return executed, to_forward

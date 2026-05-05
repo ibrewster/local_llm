@@ -27,8 +27,6 @@ cache_lock = Lock()
 model_ready = {}
 loaded_models = {}
 
-HA_MARKER = "####HOME ASSISTANT REQUEST####"
-
 FUN_SAMPLER = sample_utils.make_sampler(
     temp=1.0, # was 0.95
     top_p=1.0, # was 0.9
@@ -61,12 +59,12 @@ MCP_CLIENT_CONFIG = {
     "mcpServers": {
         # "MCPAssist": {
             # "url": "http://10.27.81.207:8090",
-        # }, 
+        # },
         "homeassistant": {
             "url": "http://10.27.81.207:8123/api/mcp",
             "headers": {
                 "Authorization": f"Bearer {config.HA_TOKEN}"
-            }    
+            }
         },
         # "searxng-http": {
             # "url": "http://10.27.81.60:3003/mcp",
@@ -74,7 +72,7 @@ MCP_CLIENT_CONFIG = {
                 # "SEARXNG_URL": "http://10.27.81.60:3002/search",
                 # "MCP_HTTP_PORT": "3003"
             # }
-        # },      
+        # },
         "tavily": {
             "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={config.TAVILY_TOKEN}",
         },
@@ -88,28 +86,28 @@ mlx_inference_lock = threading.Lock()
 
 def init_logging():
     log_path = config.LOG_PATH
-        
+
     handler = RotatingFileHandler(
         log_path,
         maxBytes=10_000_000,  # 10MB
         backupCount=5
     )
-    
+
     formatter = logging.Formatter(
         '[%(asctime)s] %(levelname)-5s %(threadName)s %(message)s',
         datefmt='%d/%b/%Y:%H:%M:%S %z'
     )
-    
+
     handler.setFormatter(formatter)
-    
+
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logger.addHandler(handler)
-    
+
     console = logging.StreamHandler()
     console.setFormatter(formatter)
     logger.addHandler(console)
-  
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -126,7 +124,7 @@ def model_digest(model_id: str) -> str:
 
 def model_details(model_name: str) -> dict:
     """Build details from the actual loaded model config."""
-    
+
     model_info = loaded_models[model_name]
     repo_id = model_info['repo_id']
     model_config = model_info['config']
@@ -134,7 +132,7 @@ def model_details(model_name: str) -> dict:
     return {
         "parent_model": "",
         "format": "safetensors",
-        "family": family, 
+        "family": family,
         "families": [family],
         "parameter_size": _param_size(model_name, model_config),
         "quantization_level": _quant_from_repo_id(repo_id)
@@ -154,14 +152,14 @@ def _param_size_from_name(name: str):
     m = re.search(r'(\d+(?:\.\d+)?)B', name, re.IGNORECASE)
     if m:
         return f"{m.group(1)}B"
-    
+
 def _estimate_from_config(config: dict) -> str:
     """Estimate parameter count from hidden_size/num_layers if not explicit."""
     # Qwen config.json has num_parameters directly in some versions,
     # otherwise derive it or just read it from the directory name / model card
     if n := config.get("num_parameters"):
         return f"{n/1e9:.1f}B"
-    
+
     h = config.get("hidden_size")
     i = config.get("intermediate_size")
     L = config.get("num_hidden_layers")
@@ -172,7 +170,7 @@ def _estimate_from_config(config: dict) -> str:
         total = L * per_layer + v * h
         billions = int(round(total / 1e9))
         return f"{billions}B"
-    
+
     return "7B"  # fallback
 
 def _quant_from_repo_id(repo_id: str) -> str:
@@ -345,13 +343,13 @@ def is_tool_response_request(messages: list) -> bool:
         and isinstance(last.get("content"), str)
         and "response_type" in last["content"]
     )
-    
+
 def load_model(name, path):
     logging.info(f"Loading {name}")
     model, tokenizer, model_config= load(path, return_config=True)
-        
+
     model_bytes = sum(x.nbytes for _, x in mx_utils.tree_flatten(model.parameters()))
-    
+
     loaded_models[name] = {
         "model": model,
         "tokenizer": tokenizer,
@@ -362,7 +360,7 @@ def load_model(name, path):
     }
     model_ready[name] = threading.Event()
     model_ready[name].set()
-    
+
 def unload_model(name):
     if name not in loaded_models:
         logging.warning(f"Model {name} not found")

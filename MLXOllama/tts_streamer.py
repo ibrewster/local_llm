@@ -21,27 +21,31 @@ class TTSStreamer():
         # self._audio_model = load_model("mlx-community/orpheus-3b-0.1-ft-6bit")
         # self._audio_model = load_model("mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-6bit")
         self._msgs_streamed = 0
-        
+
     def run(self):
         logging.info("TTS Streamer process running")
-        try:                
+        try:
             while True:
                 msg = self._queue.get()
+                ###### DEBUG REMOVE ######
+                logging.info(f"{msg[0]}")
+                continue
+            ###########################
                 if msg == "__FLUSH__":
                     self._packetizer.flush()
                     self._msgs_streamed = 0
                     continue
-                
+
                 if not isinstance(msg, (tuple, list)):
                     msg = (msg, )
-                    
+
                 self.send_tts(*msg)
                 self._msgs_streamed += 1
-                
-                    
+
+
         except KeyboardInterrupt:
             logging.info("TTS Streamer process exiting")
-            
+
     def send_tts(self, data, speed=1.1, voice="af_sarah"):
         replacements = {
             # Sky / skies fixes (most important for you)
@@ -54,13 +58,13 @@ class TTSStreamer():
             "Nenana": "knee-nann-uh",
             # ",": "-",
         }
-        
+
         for old, new in replacements.items():
             data = data.replace(old, new)
-            
-        t0 = time.time()        
+
+        t0 = time.time()
         for chunk in self._audio_model.generate(data, voice=voice, lang="a", speed=speed, stream=True):
-            logging.info(f"Streamed sentence after {time.time() - t0}")            
+            logging.info(f"Streamed sentence after {time.time() - t0}")
             numpy_audio = numpy.array(chunk.audio)
             rms = numpy.sqrt(numpy.mean(numpy_audio**2))
             curr_db = 20 * numpy.log10(rms) if rms > 0 else -100
@@ -69,7 +73,7 @@ class TTSStreamer():
             # normalized_mx = mx.tanh(chunk.audio * self.TARGET_GAIN)
             # audio_np = numpy.array(normalized_mx).astype(numpy.float32)
             self._packetizer.push(audio_np)
-            
+
 
 def run_tts_streamer(text_queue:multiprocessing.Queue):
     setproctitle.setproctitle("Hermes Speaker")

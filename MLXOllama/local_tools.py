@@ -23,7 +23,7 @@ LOCAL_TOOLS = {
                 "required": []
             }
         }
-    },    
+    },
     "list_playlists": {
         "type": "function",
         "function": {
@@ -47,7 +47,7 @@ LOCAL_TOOLS = {
                 "required": []
             }
         }
-    },    
+    },
     # "list_albums": {
         # "type": "function",
         # "function": {
@@ -66,7 +66,7 @@ LOCAL_TOOLS = {
                 # "required": []
             # }
         # }
-    # },    
+    # },
     "search_music": {
         "type": "function",
         "function": {
@@ -88,7 +88,7 @@ LOCAL_TOOLS = {
                 "required": ["query"]
             }
         }
-    }, 
+    },
     "play_track": {
         "type": "function",
         "function": {
@@ -210,11 +210,11 @@ LOCAL_TOOLS = {
 async def get_current_time(timezone: str | None = None) -> str:
     """
     Returns current date and time as a string.
-    
+
     Args:
         timezone: Optional IANA timezone name (e.g. 'America/Anchorage', 'Europe/London', 'UTC')
                  If None, uses the system's local timezone (or fallback to UTC).
-    
+
     Returns:
         Formatted string like: "2026-03-17 14:55 AKDT"
     """
@@ -231,16 +231,16 @@ async def get_current_time(timezone: str | None = None) -> str:
         # or strictly: tz = pytz.utc  ← choose one philosophy
 
     now = datetime.now(tz)
-    
+
     # Most readable format for agents & humans
     return now.strftime("%Y-%m-%d %-I:%M:%S %p %Z")
 
 async def local_entity_state(entity_ids: str | list[str]) -> str:
     from . import cache_utils
-    
+
     if isinstance(entity_ids, str):
         entity_ids = [entity_ids]
-    
+
     result = {}
     missing = []
 
@@ -262,9 +262,9 @@ async def local_entity_state(entity_ids: str | list[str]) -> str:
 async def get_current_weather(latitude=None, longitude=None, location=None, timeframe="today"):
     headers = {"User-Agent": "Starfleet-Command-AVO-Assistant/1.0 (israel@MacStudio)"}
     now = datetime.now() # Mar 19, 2026 (Thursday)
-    
+
     async with httpx.AsyncClient(timeout=20.0) as client:
-    
+
         # 1. Sensor Selection
         if latitude and longitude:
             # Use direct coordinates (Highest Precision / Lowest Latency)
@@ -279,7 +279,7 @@ async def get_current_weather(latitude=None, longitude=None, location=None, time
         #  Make sure lat/lon are numbers
         lat = float(lat)
         lon = float(lon)
-        
+
         # 2. Get NWS Grid
         pts_res = await client.get(
             f"https://api.weather.gov/points/{lat:.3f},{lon:.3f}",
@@ -292,7 +292,7 @@ async def get_current_weather(latitude=None, longitude=None, location=None, time
                 'content': pts_res.text,
             }
             return json.dumps(resp)
-        
+
         forecast_url = pts_res.json()["properties"]["forecast"]
 
         # 3. Get Full Forecast (Next 7 days)
@@ -308,22 +308,22 @@ async def get_current_weather(latitude=None, longitude=None, location=None, time
         if timeframe == "this weekend":
             return json.dumps([p for p in periods if friday_date <=
                                 datetime.fromisoformat(p["startTime"]).date() <= sunday_date])
-        
+
         if timeframe == "today":
             return json.dumps([p for p in periods if
                                 datetime.fromisoformat(p["startTime"]).date() == now.date()])
 
         return json.dumps(periods[:6]) # Default to 3 days (day/night pairs)
-  
-################ MUSIC PLAYBACK USING apple-music-custom ########################  
-ITUNES_URL='http://localhost:8181'
+
+################ MUSIC PLAYBACK USING apple-music-custom ########################
+from .config import ITUNES_URL
 
 async def get_current_playback(server_base_url: str = ITUNES_URL) -> dict[str, Any]:
     """Get the current playback state from the apple-music-custom server.
-    
+
     Returns detailed info about what's currently playing (or paused/stopped),
     including track metadata, artist, album, playback position, state, etc.
-    
+
     This is the best endpoint for "what's playing right now?" queries.
     """
     try:
@@ -338,13 +338,13 @@ async def get_current_playback(server_base_url: str = ITUNES_URL) -> dict[str, A
             if data and isinstance(data, dict):
                 state = data.get("state", "stopped")
                 track = data.get("track", {})
-                
+
                 if track and state in ("playing", "paused"):
                     summary = f"{state.capitalize()}: {track.get('name')} by {track.get('artist')} " \
                               f"from {track.get('album')}"
                 else:
                     summary = "Nothing is currently playing."
-                
+
                 data["friendly_summary"] = summary  # helpful for LLM reasoning
 
             return json.dumps(data)
@@ -357,8 +357,8 @@ async def get_current_playback(server_base_url: str = ITUNES_URL) -> dict[str, A
         return json.dumps({"error": f"HTTP error: {e}"})
     except Exception as e:
         return json.dumps({"error": f"Failed to get current playback: {str(e)}"})
-    
-    
+
+
 async def _set_shuffle(enable: bool):
     """
     Internal helper to set shuffle mode via PUT /shuffle.
@@ -377,7 +377,7 @@ async def pause_music():
         response = await client.put(f"{ITUNES_URL}/pause")
         response.raise_for_status()
         return response.text
-    
+
 async def list_playlists():
     """
     GET /playlists.
@@ -387,7 +387,7 @@ async def list_playlists():
         response = await client.get(f"{ITUNES_URL}/playlists")
         response.raise_for_status()
         return response.text
-    
+
 async def list_albums(offset: int = 0, limit: int = 100):
     """
     GET /albums.
@@ -400,7 +400,7 @@ async def list_albums(offset: int = 0, limit: int = 100):
 
 async def search_music(query: str, server_base_url: str = "http://localhost:8181"):
     """Unified search across cached albums/artists + server track search.
-    
+
     Returns candidates in a consistent format so the LLM can pick the best match.
     """
     results = {
@@ -460,8 +460,8 @@ async def search_music(query: str, server_base_url: str = "http://localhost:8181
         print(f"Unexpected error in track search: {e}")
 
     return json.dumps(results)
-    
-    
+
+
 
 async def play_track(track_id: str):
     """
