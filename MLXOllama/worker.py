@@ -126,61 +126,25 @@ CURRENT_MONTH = {current_month}
         {"role": "user","content": prompt + dynamic_info,}
     ]
 
-
-    mod_info = utils.loaded_models[config.MAIN_MODEL]
-    model = mod_info['model']
-    tokenizer = mod_info['tokenizer']
-
-    cache, _ = asyncio.run(get_cache(mod_info, message, None))
-    if cache:
-        cache = copy.copy(cache)
-        message = message[1:]
-
     sampler = sample_utils.make_sampler(
         temp=0.95,
         top_p=0.92
     )
 
-    formatted_prompt = tokenizer.apply_chat_template(
-        message,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False
-    )
-
+    token_queue: queue.Queue = submit_inference_job(message, sampler=sampler)
+    
     remainder = ""
     body_sentences = []
     sentence_index = 0
     first_sentence = -1
-    
-    token_queue: queue.Queue = queue.Queue()
-
-    def thread_worker():
-        try:
-            with utils.mlx_inference_lock:
-                # This runs in a worker thread
-                for response in stream_generate(
-                    model,
-                    tokenizer,
-                    prompt=formatted_prompt,
-                    sampler=sampler,
-                    prompt_cache=cache
-                ):
-                    token_queue.put_nowait(
-                        (response.text, response.token, False, None)
-                    )
-            token_queue.put_nowait(
-                ("", None, True, None)
-            )
-
-        except Exception as e:
-            token_queue.put_nowait( (None, None, True, e))
-
-    inference_worker.submit(thread_worker)
-    
+     
     while True:
         result = token_queue.get()
         text, token, is_done, err = result
+        if err:
+            logging.error(f"Unable to generate result: {err}")
+            remainder = "I'm sorry, but I was unable to generate a goodnight poem. Check the logs for more information."
+            break        
         
         remainder += text
         if '\n' in remainder:
@@ -213,9 +177,6 @@ CURRENT_MONTH = {current_month}
 
 def speak_thread(speak_queue):
     logging.info("Listening for prompts")
-    mod_info = utils.loaded_models[config.MAIN_MODEL]
-    model = mod_info['model']
-    tokenizer = mod_info['tokenizer']
 
     while True:
         mx.clear_cache()
@@ -245,7 +206,6 @@ def speak_thread(speak_queue):
             continue
         ################################################
 
-
         t1=time.time()
         use_thinking = prompt.startswith("/think")
         clean_prompt = prompt.replace("/think", "").strip()
@@ -254,53 +214,30 @@ def speak_thread(speak_queue):
             {"role": "user","content": clean_prompt,}
         ]
 
-        cache = None
         if system:
             message = [
                 {"role": "system","content": system}
             ] + message
 
-            cache, _ = asyncio.run(get_cache(mod_info, message, None))
-            if cache:
-                cache = copy.copy(cache)
-                message = message[1:]
-
-        formatted_prompt = tokenizer.apply_chat_template(
-            message,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=use_thinking
-        )
-
         try:
             buffer = ""
-            token_queue = queue.Queue()
-            
-            def thread_worker():
-                mx.random.seed(int(time.time_ns() % 2**32))                
-                with utils.mlx_inference_lock:
-                    for response in stream_generate(
-                        model,
-                        tokenizer,
-                        prompt=formatted_prompt,
-                        sampler=utils.FUN_SAMPLER,
-                        max_kv_size=2048,
-                        max_tokens=4096,
-                        prefill_step_size=6144,
-                        prompt_cache=cache
-                    ):
-                        token_queue.put_nowait(
-                            (response.text, response.token, False, None)
-                        )
-                token_queue.put(("", None, True, None))
-                        
-            inference_worker.submit(thread_worker)
+            token_queue = submit_inference_job(
+                message,
+                thinking=use_thinking,
+                sampler=utils.FUN_SAMPLER,
+                max_kv_size=2048, 
+                max_tokens=4096
+            )
             
             is_thinking = False
             sentence_count = 0
             while True:
                 result = token_queue.get()
                 token_text, token, is_done, err = result
+                if err:
+                    logging.error(f"Unable to generate result: {err}")
+                    buffer = "I'm sorry, but an error occured. Please check the logs for more information."
+                    break
 
                 # Check for state changes
                 if "<think>" in token_text or '<channel|>' in token_text:
@@ -366,9 +303,17 @@ def submit_inference_job(
     max_kv_size=None,
     max_tokens=None
 ) -> queue.Queue:
+    
     mod_info = utils.loaded_models[config.MAIN_MODEL]
     model = mod_info['model']
     tokenizer = mod_info['tokenizer']
+    
+    cache = None
+    if len(message) > 1 and message[0]['role'] == 'system':
+        cache, _ = asyncio.run(get_cache(mod_info, message, None))
+        if cache:
+            cache = copy.copy(cache)
+            message = message[1:]        
     
     formatted_prompt = tokenizer.apply_chat_template(
         message,

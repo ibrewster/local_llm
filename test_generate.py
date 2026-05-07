@@ -5,8 +5,8 @@ URL = "http://127.0.0.1:11434/generate"
 
 # The payload as required by your endpoint
 payload = {
-    "prompt": "Generate two or three sentences just to ensure that the code pathway is working. Output just the sentences. Make the last sentence be literally 'That's all folks', so I can be sure the entire response came through.",
-#    "prompt": "It is bedtime. The current weather is 22°C with a light breeze and clear skies.",
+#    "prompt": "Generate two or three sentences just to ensure that the code pathway is working. Output just the sentences. Make the last sentence be literally 'That's all folks', so I can be sure the entire response came through.",
+    "prompt": "It is bedtime. The current weather is 22°C with a light breeze and clear skies.",
 #    "system": "You are a calm and soothing bedtime storyteller."
 }
 
