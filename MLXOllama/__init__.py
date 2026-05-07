@@ -25,7 +25,9 @@ def setup_app():
     global app, speak_queue, process_thread, tts_queue, tts_process
     
     for name, path in config.models.items():
-        utils.load_model(name, path)
+        future = utils.inference_worker.submit(utils.load_model, name, path)
+        future.result() #  Wait for the result
+        # utils.load_model(name, path)
     
     logging.info('Models loaded')
     

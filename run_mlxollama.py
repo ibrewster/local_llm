@@ -70,5 +70,7 @@ if __name__ == "__main__":
         if tts_process.is_alive():
             tts_process.kill()
         MLXOllama.app.logger.info("Speaker process stopped")
+    
+    MLXOllama.utils.inference_worker.shutdown()
         
     MLXOllama.app.logger.info("MLXOllama has exited")

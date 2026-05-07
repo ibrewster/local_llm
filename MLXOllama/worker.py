@@ -5,7 +5,6 @@ import gc
 import json
 import logging
 import queue
-import threading
 import time
 import random
 import re
@@ -16,7 +15,7 @@ import mlx.core as mx
 
 from . import utils, config, local_tools, tts_queue
 from .cache_utils import get_cache
-
+from .utils import inference_worker
 
 alaskan_content = {
     "Alaskan Lifestyle Object": [
@@ -153,34 +152,58 @@ CURRENT_MONTH = {current_month}
     body_sentences = []
     sentence_index = 0
     first_sentence = -1
-    with utils.mlx_inference_lock:
-        mx.random.seed(int(time.time()))
-        for token in stream_generate(
-            model,
-            tokenizer,
-            prompt=formatted_prompt,
-            prompt_cache=cache,
-            sampler=sampler
-        ):
-            remainder += token.text
-            if '\n' in remainder:
-                head, *tail = remainder.split('\n')
+    
+    token_queue: queue.Queue = queue.Queue()
 
-                if sentence_index == 0:
-                    first_sentence = time.time() - t0
-                if sentence_index < 2:
-                    tts_queue.put((head.strip(), 0.8, 'af_bella'))
-                else:
-                    body_sentences.append(head)
-                sentence_index += 1
+    def thread_worker():
+        try:
+            with utils.mlx_inference_lock:
+                # This runs in a worker thread
+                for response in stream_generate(
+                    model,
+                    tokenizer,
+                    prompt=formatted_prompt,
+                    sampler=sampler,
+                    prompt_cache=cache
+                ):
+                    token_queue.put_nowait(
+                        (response.text, response.token, False, None)
+                    )
+            token_queue.put_nowait(
+                ("", None, True, None)
+            )
 
-                remainder = "\n".join(tail) # Handles empty automatically
+        except Exception as e:
+            token_queue.put_nowait( (None, None, True, e))
 
-        if remainder.strip():
-            body_sentences.append(remainder)
-            body_text = "\n".join(body_sentences)
-            body_text = re.sub(r'(?<!\n)\n(?!\n)', ' ', body_text)
-            tts_queue.put((body_text, 0.8, 'af_bella'))
+    inference_worker.submit(thread_worker)
+    
+    while True:
+        result = token_queue.get()
+        text, token, is_done, err = result
+        
+        remainder += text
+        if '\n' in remainder:
+            head, *tail = remainder.split('\n')
+
+            if sentence_index == 0:
+                first_sentence = time.time() - t0
+            if sentence_index < 2:
+                tts_queue.put((head.strip(), 0.8, 'af_bella'))
+            else:
+                body_sentences.append(head)
+            sentence_index += 1
+
+            remainder = "\n".join(tail) # Handles empty automatically
+            
+        if is_done:
+            break
+
+    if remainder.strip():
+        body_sentences.append(remainder)
+        body_text = "\n".join(body_sentences)
+        body_text = re.sub(r'(?<!\n)\n(?!\n)', ' ', body_text)
+        tts_queue.put((body_text, 0.8, 'af_bella'))
 
     tts_queue.put("__FLUSH__")
 
@@ -227,7 +250,6 @@ def speak_thread(speak_queue):
         use_thinking = prompt.startswith("/think")
         clean_prompt = prompt.replace("/think", "").strip()
 
-
         message = [
             {"role": "user","content": clean_prompt,}
         ]
@@ -251,65 +273,80 @@ def speak_thread(speak_queue):
         )
 
         try:
-            with utils.mlx_inference_lock:
-                buffer = ""
-                mx.random.seed(int(time.time_ns() % 2**32))
+            buffer = ""
+            token_queue = queue.Queue()
+            
+            def thread_worker():
+                mx.random.seed(int(time.time_ns() % 2**32))                
+                with utils.mlx_inference_lock:
+                    for response in stream_generate(
+                        model,
+                        tokenizer,
+                        prompt=formatted_prompt,
+                        sampler=utils.FUN_SAMPLER,
+                        max_kv_size=2048,
+                        max_tokens=4096,
+                        prefill_step_size=6144,
+                        prompt_cache=cache
+                    ):
+                        token_queue.put_nowait(
+                            (response.text, response.token, False, None)
+                        )
+                token_queue.put(("", None, True, None))
+                        
+            inference_worker.submit(thread_worker)
+            
+            is_thinking = False
+            sentence_count = 0
+            while True:
+                result = token_queue.get()
+                token_text, token, is_done, err = result
 
-                stream = stream_generate(
-                    model,
-                    tokenizer,
-                    prompt=formatted_prompt,
-                    sampler=utils.FUN_SAMPLER,
-                    max_kv_size=2048,
-                    max_tokens=4096,
-                    prefill_step_size=6144,
-                    prompt_cache=cache
-                )
+                # Check for state changes
+                if "<think>" in token_text or '<channel|>' in token_text:
+                    is_thinking = True
+                    # Strip the tag itself if it's bundled with other text
+                    token_text = token_text.replace("<think>", "")
+                    token_text = token_text.replace('<channel|>', "")
 
-                is_thinking = False
-                sentence_count = 0
-                for chunk in stream:
-                    token_text = chunk.text
-
-                    # Check for state changes
-                    if "<think>" in token_text or '<channel|>' in token_text:
-                        is_thinking = True
-                        # Strip the tag itself if it's bundled with other text
-                        token_text = token_text.replace("<think>", "")
-                        token_text = token_text.replacte('<channel|>', "")
-
-                    if "</think>" in token_text or '<|channel>' in token_text:
-                        is_thinking = False
-                        # Strip the tag and continue—only text AFTER this is the 'answer'
-                        token_text = token_text.split("<|channel>")[-1]
-                        if not token_text:
-                            continue
-
-                    # If the model is currently 'thinking', skip sending to buffer/TTS
-                    if is_thinking:
+                if "</think>" in token_text or '<|channel>' in token_text:
+                    is_thinking = False
+                    # Strip the tag and continue—only text AFTER this is the 'answer'
+                    token_text = token_text.split("<|channel>")[-1]
+                    if not token_text:
                         continue
 
-                    content = token_text
-                    if not content:
+                # If the model is currently 'thinking', skip sending to buffer/TTS
+                if is_thinking:
+                    continue
+
+                content = token_text
+                if not content:
+                    if is_done:
+                        break
+                    else:
                         continue
-                    buffer += content
+                buffer += content
 
-                    pattern = utils.sentence_endings_conservative if sentence_count < 2 else utils.paragraph_split
-                    matches = list(pattern.finditer(buffer))
+                pattern = utils.sentence_endings_conservative if sentence_count < 2 else utils.paragraph_split
+                matches = list(pattern.finditer(buffer))
 
-                    if matches:
-                        last_match = matches[-1]
-                        split_point = last_match.end()
+                if matches:
+                    last_match = matches[-1]
+                    split_point = last_match.end()
 
-                        complete = buffer[:split_point]
-                        buffer = buffer[split_point:]
+                    complete = buffer[:split_point]
+                    buffer = buffer[split_point:]
 
-                        if sentence_count == 0:
-                            logging.info(f"Mode: {'Reasoning' if use_thinking else 'Instant'}")
-                            logging.info(f"Time to first sentence: {time.time()-t1}")
-                        sentence_count += 1
-                        logging.debug(complete.strip())
-                        tts_queue.put(complete.strip())
+                    if sentence_count == 0:
+                        logging.info(f"Mode: {'Reasoning' if use_thinking else 'Instant'}")
+                        logging.info(f"Time to first sentence: {time.time()-t1}")
+                    sentence_count += 1
+                    logging.debug(complete.strip())
+                    tts_queue.put(complete.strip())
+                    
+                if is_done: # failsafe, but we shouldn't get here.
+                    break
 
             # Flush remaining text
             if buffer:
@@ -319,6 +356,52 @@ def speak_thread(speak_queue):
             logging.info(f"Completed inference in {time.time() - t1}")
 
     logging.info("Prompt processing thread exited")
+
+
+def submit_inference_job(
+    message: list,
+    *,
+    thinking=False,
+    sampler=None,
+    max_kv_size=None,
+    max_tokens=None
+) -> queue.Queue:
+    mod_info = utils.loaded_models[config.MAIN_MODEL]
+    model = mod_info['model']
+    tokenizer = mod_info['tokenizer']
+    
+    formatted_prompt = tokenizer.apply_chat_template(
+        message,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=thinking
+    )
+    
+    token_queue: queue.Queue = queue.Queue()
+
+    def thread_worker():
+        try:
+            with utils.mlx_inference_lock:
+                # This runs in a worker thread
+                for response in stream_generate(
+                    model,
+                    tokenizer,
+                    prompt=formatted_prompt,
+                    sampler=sampler,
+                    prompt_cache=cache
+                ):
+                    token_queue.put_nowait(
+                        (response.text, response.token, False, None)
+                    )
+            token_queue.put_nowait(
+                ("", None, True, None)
+            )
+
+        except Exception as e:
+            token_queue.put_nowait( (None, None, True, e))
+
+    inference_worker.submit(thread_worker)
+    return token_queue
 
 def run_dummy_inference():
     """Run the fastest possible inference, just to keep things alive/in ram"""
@@ -341,14 +424,19 @@ def run_dummy_inference():
             top_p=1.0,
         )
 
-        with utils.mlx_inference_lock:
-            _ = generate(
-                model,
-                tokenizer,
-                prompt=formatted,
-                sampler=sampler,
-                max_tokens=1
-            )
+        def thread_worker():                
+            with utils.mlx_inference_lock:
+                _ = generate(
+                    model,
+                    tokenizer,
+                    prompt=formatted,
+                    sampler=sampler,
+                    max_tokens=1
+                )
+        future = inference_worker.submit(thread_worker)
+        
+        future.result()
+        
         logging.info(f"Ran keep-alive inference for {mod_name} in {time.time() - t1}")
 
 
@@ -436,15 +524,14 @@ async def _stream_tokens(
                 )
 
             except Exception as e:
-                loop.call_soon_threadsafe(queue.put_nowait, (None, None, True, e))
+                loop.call_soon_threadsafe(token_queue.put_nowait, (None, None, True, e))
 
-        thread = threading.Thread(target=thread_worker, daemon=True)
-        thread.start()
+        inference_worker.submit(thread_worker)
 
         while True:
             result = await token_queue.get()
 
-            text, token,is_done, err = result
+            text, token, is_done, err = result
 
             if isinstance(err, Exception):
                 # Optional: yield partial + log, then re-raise or swallow
@@ -503,61 +590,73 @@ async def generate_stream(stream, model_info, msg_history, options,
         unicode_buf = ""
         first_token = True
 
-        async for token, done, stats in _stream_tokens(
-            model_info, msg_history, options, state, tools=tools, think=think
-        ):
-            if unicode_buf or '\\' in token:
-                unicode_buf += token
-                if len(unicode_buf) >= 6:  # \uXXXX is 6 chars
-                    token = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), unicode_buf)
-                    unicode_buf = ""
-                else:
-                    continue
-
-            if first_token:
-                first_token = False
-                if "thought" in token and not "<|channel>" in token:
-                    logging.warning("Missing <|channel>! Prepending")
-                    token = "<|channel>" + token
-
-            full_text += token
-
-            if tool_call_detected:
-                continue
-
-            # See if we have a tool call. If so, stop streaming and accumulate tool calls
-            if buffer or "<" in token:
-                buffer += token
-                if ">" in buffer:
-                    if "<tool_call>" in buffer or "<|tool_call>" in buffer:
-                        tool_call_detected = True
-                        continue
-
-                    # Clean up Gemma 4 output
-                    elif "<channel|>" in buffer:
-                        buffer = re.sub(r'(<\|channel>.*?)?<channel\|>', '', buffer, flags=re.DOTALL)
-                        token = buffer
-                        buffer = ""
-                    elif "<|channel>" in buffer:
-                        continue
+        try:
+            async for token, done, stats in _stream_tokens(
+                model_info, msg_history, options, state, tools=tools, think=think
+            ):
+                if unicode_buf or '\\' in token:
+                    unicode_buf += token
+                    if len(unicode_buf) >= 6:  # \uXXXX is 6 chars
+                        token = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), unicode_buf)
+                        unicode_buf = ""
                     else:
-                        token = buffer
-                        buffer = ""
-                else:
-                    continue  # still accumulating, don't stream yet
-
-            if not tool_call_detected and stream: # and not done:
-                chunk = {
-                    "model": model_name,
-                    "done": done
-                }
-                if is_gen:
-                    chunk["response"] = token
-                else:
-                    chunk['message'] =  {"role": "assistant", "content": token}
-
-                line = json.dumps(chunk) + "\n"
-                yield line
+                        continue
+    
+                if first_token:
+                    first_token = False
+                    if "thought" in token and not "<|channel>" in token:
+                        logging.warning("Missing <|channel>! Prepending")
+                        token = "<|channel>" + token
+    
+                full_text += token
+    
+                if tool_call_detected:
+                    continue
+    
+                # See if we have a tool call. If so, stop streaming and accumulate tool calls
+                if buffer or "<" in token:
+                    buffer += token
+                    if ">" in buffer:
+                        if "<tool_call>" in buffer or "<|tool_call>" in buffer:
+                            tool_call_detected = True
+                            continue
+    
+                        # Clean up Gemma 4 output
+                        elif "<channel|>" in buffer:
+                            if think:
+                                token = buffer.replace('<channel|>', '</thought>\n')
+                            else:                                
+                                buffer = re.sub(r'(<\|channel>.*?)?<channel\|>', '', buffer, flags=re.DOTALL)
+                                token = buffer
+                            buffer = ""
+                        elif "<|channel>" in buffer:
+                            if think:
+                                token = buffer.replace('<|channel>', '<thought>\n')
+                                buffer = ""
+                            else:
+                                continue
+                        else:
+                            token = buffer
+                            buffer = ""
+                    else:
+                        continue  # still accumulating, don't stream yet
+    
+                if not tool_call_detected and stream: # and not done:
+                    chunk = {
+                        "model": model_name,
+                        "done": done
+                    }
+                    if is_gen:
+                        chunk["response"] = token
+                    else:
+                        chunk['message'] =  {"role": "assistant", "content": token}
+    
+                    line = json.dumps(chunk) + "\n"
+                    yield line
+        except Exception as e:
+            logging.exception(f"Unable to finish response: {e}")
+        except asyncio.exceptions.CancelledError:
+            logging.warning(f"Request Canceled")
 
         logging.info(f"Generated response in {time.time() - t2}")
         logging.info(f"Raw Response: {full_text}")

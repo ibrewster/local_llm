@@ -36,7 +36,7 @@ class TTSStreamer():
                 # except Exception as e:
                     # logging.info(str(msg))
                 # continue
-            ###########################
+                ###########################
                 if msg == "__FLUSH__":
                     self._packetizer.flush()
                     self._msgs_streamed = 0

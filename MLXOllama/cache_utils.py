@@ -20,7 +20,7 @@ from cachetools import TTLCache
 from mlx_lm.models.cache import make_prompt_cache, save_prompt_cache, load_prompt_cache
 
 from . import utils, config
-from .utils import MCP_CLIENT
+from .utils import MCP_CLIENT, inference_worker
 
 static_caches = {}
 dynamic_caches = TTLCache(maxsize=8, ttl=172800)
@@ -82,7 +82,9 @@ _cache_io_lock = asyncio.Lock()
 
 async def _save_static_caches():
     async with _cache_io_lock:
-        await asyncio.to_thread(_save_caches)
+        future = inference_worker.submit(_save_caches)
+        await asyncio.wrap_future(future)
+#        await asyncio.to_thread(_save_caches)
 
 def _save_caches():
     path: Path = Path(__file__).parent / "Caches"
@@ -102,7 +104,9 @@ def _save_caches():
 
 async def _load_static_caches():
     async with _cache_io_lock:
-        await asyncio.to_thread(_load_caches)
+        future = inference_worker.submit(_load_caches)
+        await asyncio.wrap_future(future)
+        #        await asyncio.to_thread(_load_caches)
 
 def _load_caches():
     path = Path(__file__).parent / "Caches"
@@ -418,7 +422,9 @@ async def _build_cache(model_info, system_prompt, tools, user_prompt=""):
             mx.eval(logits)
         return cache
 
-    cache = await asyncio.to_thread(_populate_cache, model, prefix_tokens)
+    future = inference_worker.submit(_populate_cache, model, prefix_tokens)
+    cache = await asyncio.wrap_future(future)
+#    cache = await asyncio.to_thread(_populate_cache, model, prefix_tokens)
     logging.info(f"Prefix tokens: {len(prefix_tokens)}")
 
     return cache

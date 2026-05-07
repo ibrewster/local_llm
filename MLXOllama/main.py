@@ -136,7 +136,7 @@ async def api_generate():
     model_info = utils.loaded_models[model_name]
 
     if stream:
-        return quart.Response(
+        response = quart.Response(
             worker.generate_stream(
                 stream,
                 model_info,
@@ -146,6 +146,9 @@ async def api_generate():
                 ),
             mimetype="application/x-ndjson"
         )
+        response.timeout = None
+        return response
+    
     else:
         # just collect the last yielded completion object
         async for chunk_json in worker.generate_stream(
@@ -222,7 +225,7 @@ async def api_chat():
         return quart.Response(generate(), content_type='application/x-ndjson')
         
     if stream:
-        return quart.Response(
+        response = quart.Response(
             worker.generate_stream(
                 stream,
                 model_info,
@@ -231,8 +234,10 @@ async def api_chat():
                 tools=tools,
                 think=think
             ), 
-            mimetype="application/x-ndjson"
+            mimetype="application/x-ndjson",
         )
+        response.timeout = None
+        return response
     else:
         # just collect the last yielded completion object
         async for chunk_json in worker.generate_stream(

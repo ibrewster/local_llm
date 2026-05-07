@@ -1,12 +1,15 @@
+import asyncio
 import gc
 import hashlib
 import json
 import logging
+import queue
 import re
 import threading
 import uuid
 
 from asyncio import Lock
+from concurrent.futures import Future
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -14,7 +17,6 @@ from typing import List, Dict, Optional
 
 import mlx.utils as mx_utils
 import mlx.core as mx
-
 
 from cachetools import TTLCache
 from huggingface_hub import snapshot_download
@@ -26,6 +28,56 @@ from . import config, mcp_client
 cache_lock = Lock()
 model_ready = {}
 loaded_models = {}
+
+
+class InferenceWorker:
+    _STOP = object()
+    
+    def __init__(self, name="Hermes_Thinker"):
+        self.tasks = queue.Queue()
+        self.shutdown_flag = False
+        
+        self.thread = threading.Thread(
+            target=self._run,
+            name=name,
+            daemon=True,
+        )
+        self.thread.start()
+
+    def submit(self, fn, *args, **kwargs):
+        if self.shutdown_flag:
+            raise RuntimeError("Worker has been shut down")
+        
+        future = Future()
+        self.tasks.put((future, fn, args, kwargs))
+        return future
+    
+    def shutdown(self, wait=True):
+        if not self.shutdown_flag:
+            self.shutdown_flag = True
+            self.tasks.put(self._STOP)
+
+        if wait:
+            self.thread.join()    
+
+    def _run(self):
+        while True:
+            item = self.tasks.get()
+            if item is self._STOP:
+                logging.info("Inference worker thread stopping")
+                break
+            
+            future, fn, args, kwargs = item
+
+            if future.set_running_or_notify_cancel():
+                try:
+                    result = fn(*args, **kwargs)
+                except (asyncio.exceptions.CancelledError, Exception) as e:
+                    future.set_exception(e)
+                else:
+                    future.set_result(result)
+
+inference_worker = InferenceWorker(name="Hermes_Thinker")
 
 FUN_SAMPLER = sample_utils.make_sampler(
     temp=1.0, # was 0.95
