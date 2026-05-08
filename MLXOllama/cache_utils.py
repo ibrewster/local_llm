@@ -277,8 +277,8 @@ async def cache_refresh_loop():
                 # Delete the old first to free memory
                 if 'HA' in static_caches:
                     del static_caches['HA']
-                mx.clear_cache()
-                gc.collect()
+                # mx.clear_cache()
+                # gc.collect()
 
                 cache = await create_ha_cache()
                 static_caches['HA'] = cache

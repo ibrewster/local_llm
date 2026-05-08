@@ -76,11 +76,11 @@ class InferenceWorker:
                     future.set_exception(e)
                 else:
                     future.set_result(result)
-                finally:
+                # finally:
                     # TODO: figure out if this is overkill/hurting performance
-                    mx.clear_cache()
-                    gc.collect()
-                    mx.clear_cache()                
+                    # mx.clear_cache()
+                    # gc.collect()
+                    # mx.clear_cache()                
 
 inference_worker = InferenceWorker(name="Hermes_Thinker")
 
@@ -406,7 +406,7 @@ def load_model(name, path):
     model, tokenizer, model_config= load(path, return_config=True)
 
     model_bytes = sum(x.nbytes for _, x in mx_utils.tree_flatten(model.parameters()))
-
+    
     loaded_models[name] = {
         "model": model,
         "tokenizer": tokenizer,
