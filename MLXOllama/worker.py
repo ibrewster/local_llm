@@ -10,6 +10,9 @@ import random
 import re
 import traceback
 
+from dataclasses import dataclass
+from typing import Any
+
 from mlx_lm import generate, stream_generate, sample_utils
 import mlx.core as mx
 
@@ -179,9 +182,9 @@ def speak_thread(speak_queue):
     logging.info("Listening for prompts")
 
     while True:
-        mx.clear_cache()
-        gc.collect()
-        mx.clear_cache()
+        # mx.clear_cache()
+        # gc.collect()
+        # mx.clear_cache()
         try:
             msg = speak_queue.get(timeout=300) # 5 minutes
         except queue.Empty:
@@ -294,37 +297,73 @@ def speak_thread(speak_queue):
 
     logging.info("Prompt processing thread exited")
 
-
-def submit_inference_job(
+@dataclass
+class InferenceOptions:
+    model: Any
+    tokenizer: Any
+    formatted_prompt: str
+    cache: Any
+    
+async def setup_inference(
     message: list,
     *,
-    thinking=False,
-    sampler=None,
-    max_kv_size=None,
-    max_tokens=None
-) -> queue.Queue:
-    
-    mod_info = utils.loaded_models[config.MAIN_MODEL]
-    model = mod_info['model']
-    tokenizer = mod_info['tokenizer']
-    
+    tools: list | None = None,
+    thinking: bool = False,
+    model_info: dict | None = None
+) -> InferenceOptions:
+    if model_info is None:
+        model_info = utils.loaded_models[config.MAIN_MODEL]
+    model = model_info['model']
+    tokenizer = model_info['tokenizer']    
+
     cache = None
     if len(message) > 1 and message[0]['role'] == 'system':
-        cache, _ = asyncio.run(get_cache(mod_info, message, None))
+        cache, is_ha = await get_cache(model_info, message, tools)
+        if is_ha:
+            thinking = False
+            
         if cache:
             cache = copy.copy(cache)
-            message = message[1:]        
+            message = message[1:]
+            tools = None
     
     formatted_prompt = tokenizer.apply_chat_template(
         message,
+        tools=tools, 
         tokenize=False,
         add_generation_prompt=True,
         enable_thinking=thinking
     )
     
-    token_queue: queue.Queue = queue.Queue()
+    return InferenceOptions(
+        model,
+        tokenizer,
+        formatted_prompt,
+        cache
+    )
+    
+def submit_inference(
+    opts: InferenceOptions,
+    *, 
+    sampler=None,
+    max_kv_size=None,
+    max_tokens=None,
+    loop: asyncio.AbstractEventLoop | None = None    
+) -> queue.Queue | asyncio.Queue:
+    
+    token_queue = asyncio.Queue() if loop else queue.Queue()
+        
+    def put(item):
+        if loop:
+            loop.call_soon_threadsafe(token_queue.put_nowait, item)
+        else:
+            token_queue.put_nowait(item)    
 
     def thread_worker():
+        model = opts.model
+        tokenizer = opts.tokenizer
+        formatted_prompt = opts.formatted_prompt
+        cache = opts.cache
         try:
             with utils.mlx_inference_lock:
                 # This runs in a worker thread
@@ -333,51 +372,50 @@ def submit_inference_job(
                     tokenizer,
                     prompt=formatted_prompt,
                     sampler=sampler,
-                    prompt_cache=cache
+                    prompt_cache=cache,
+                    max_tokens=max_tokens,
+                    max_kv_size=max_kv_size
                 ):
-                    token_queue.put_nowait(
-                        (response.text, response.token, False, None)
-                    )
-            token_queue.put_nowait(
-                ("", None, True, None)
-            )
+                    put((response.text, response.token, False, None))
+                    
+            put(("", None, True, None))
 
         except Exception as e:
-            token_queue.put_nowait( (None, None, True, e))
+            put((None, None, True, e))
 
     inference_worker.submit(thread_worker)
     return token_queue
+
+def submit_inference_job(
+    message: list,
+    *,
+    tools=None,
+    thinking=False,
+    sampler=None,
+    max_kv_size=None,
+    max_tokens=None,
+    loop: asyncio.AbstractEventLoop | None = None
+) -> queue.Queue:
+    opts = asyncio.run(setup_inference(message, tools=tools, thinking=thinking))
+    return submit_inference(
+        opts,
+        sampler=sampler,
+        max_kv_size=max_kv_size,
+        max_tokens=max_tokens,
+        loop=loop
+    )
 
 def run_dummy_inference():
     """Run the fastest possible inference, just to keep things alive/in ram"""
     for mod_name, mod_info in utils.loaded_models.items():
         model = mod_info['model']
-        tokenizer = mod_info['tokenizer']
-
         t1 = time.time()
-        message = [{"role": "user", "content": "Hi"}]
 
-        formatted = tokenizer.apply_chat_template(
-            message,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False
-        )
-
-        sampler = sample_utils.make_sampler(
-            temp=0.0,
-            top_p=1.0,
-        )
-
-        def thread_worker():                
+        def thread_worker():
             with utils.mlx_inference_lock:
-                _ = generate(
-                    model,
-                    tokenizer,
-                    prompt=formatted,
-                    sampler=sampler,
-                    max_tokens=1
-                )
+                dummy = mx.zeros((1, 1), dtype=mx.int32)
+                logits = model(dummy)
+                mx.eval(logits)
         future = inference_worker.submit(thread_worker)
         
         future.result()
@@ -399,22 +437,18 @@ async def _stream_tokens(
     t0 = time.time_ns()
     eval_count = 0
     try:
-        model = model_info['model']
-        tokenizer = model_info['tokenizer']
-
-        cache, is_ha = await get_cache(model_info, msg_history, tools)
-        if cache:
-            cache = copy.copy(cache)
-            tools = None
-            msg_history = msg_history[1:]
-
-        if is_ha:
-            think = False
-
+        
         if "### task:" in msg_history[-1].get("content", "").lower():
             options['temp'] = 0.1
             think = False
             options['max_tokens'] = 256
+            
+        opts = await setup_inference(
+            msg_history,
+            tools=tools,
+            thinking=think,
+            model_info=model_info
+        )
 
         sampler = sample_utils.make_sampler(
             temp=options.get("temp", 0.65),
@@ -423,13 +457,8 @@ async def _stream_tokens(
             xtc_threshold=0.1
         )
 
-        formatted_prompt = tokenizer.apply_chat_template(
-            msg_history,
-            tools=tools,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=think
-        )
+        formatted_prompt = opts.formatted_prompt
+        tokenizer = opts.tokenizer
 
         if formatted_prompt.strip().endswith("<think>"):
             yield "<think>\n", False, None
@@ -444,34 +473,14 @@ async def _stream_tokens(
         safe_max = min(options.get("max_tokens", 64000), available_space)
 
         full_output_tokens = []
-
-        token_queue: asyncio.Queue = asyncio.Queue()
+        
         loop = asyncio.get_running_loop()
-
-        def thread_worker():
-            try:
-                with utils.mlx_inference_lock:
-                    # This runs in a worker thread
-                    for response in stream_generate(
-                        model,
-                        tokenizer,
-                        prompt=suffix_tokens,
-                        max_tokens=safe_max,
-                        sampler=sampler,
-                        prompt_cache=cache
-                    ):
-                        loop.call_soon_threadsafe(
-                            token_queue.put_nowait,
-                            (response.text, response.token, False, None)
-                        )
-                loop.call_soon_threadsafe(
-                    token_queue.put_nowait, ("", None, True, None)
-                )
-
-            except Exception as e:
-                loop.call_soon_threadsafe(token_queue.put_nowait, (None, None, True, e))
-
-        inference_worker.submit(thread_worker)
+        token_queue: asyncio.Queue = submit_inference(
+            opts,
+            sampler=sampler,
+            max_tokens=safe_max,
+            loop=loop
+        )
 
         while True:
             result = await token_queue.get()
@@ -610,6 +619,15 @@ async def generate_stream(stream, model_info, msg_history, options,
 
         if not tool_calls or is_gen:
             break
+        
+        if "<channel|>" in cleaned_text:
+            if think:
+                # Replace channel with thought
+                cleaned_text = cleaned_text.replace('<channel|>', '</thought>\n')
+                cleaned_text = cleaned_text.replace('<|channel>', '<thought>\n')
+            else:
+                # Remove everything in the channel tags
+                cleaned_text = re.sub(r'(<\|channel>.*?)?<channel\|>', '', cleaned_text, flags=re.DOTALL)       
 
         executed_msgs, remaining_calls = await try_server_tools(tool_calls)
 
