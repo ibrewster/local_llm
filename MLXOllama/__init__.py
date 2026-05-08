@@ -6,6 +6,8 @@ import queue
 
 threading.current_thread().name = "MLX_MAIN"
 
+import mlx.core as mx
+
 from . import config
 os.environ["HF_HOME"] = config.HF_HOME
 os.environ["HF_TOKEN"] = config.HF_TOKEN
@@ -24,13 +26,15 @@ tts_queue: multiprocessing.Queue = None
 def setup_app():    
     global app, speak_queue, process_thread, tts_queue, tts_process
     
+    mx.set_wired_limit(42 * 1024**3)
+    
     for name, path in config.models.items():
         future = utils.inference_worker.submit(utils.load_model, name, path)
         future.result() #  Wait for the result
         # utils.load_model(name, path)
     
     logging.info('Models loaded')
-    
+        
     # Start the prompt processing thread
     from .worker import speak_thread
     speak_queue = queue.Queue()
