@@ -34,12 +34,7 @@ if __name__ == "__main__":
     
     logging.info("Starting TTS process")
     MLXOllama.tts_queue = multiprocessing.Queue()
-    tts_process = spawn_context.Process(
-        target=tts_streamer.run_tts_streamer,
-        daemon=True,
-        name="Hermes Speaker", 
-        args=(MLXOllama.tts_queue, )
-    )
+    tts_process = tts_streamer.TTSStreamer(MLXOllama.tts_queue)
     tts_process.start()    
     
     hconfig = Config()
