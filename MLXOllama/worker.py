@@ -115,7 +115,7 @@ WEEKLY_STYLES = {
 def gen_goodnight(prompt):
     t0 = time.time()
     logging.info("Goodnight generation beginning")
-    
+
     current_month = datetime.datetime.now().strftime("%B")
     day_of_year = datetime.datetime.now().timetuple().tm_yday
 

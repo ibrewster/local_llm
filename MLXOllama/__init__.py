@@ -25,8 +25,11 @@ tts_queue: multiprocessing.Queue = None
 
 def setup_app():    
     global app, speak_queue, process_thread, tts_queue, tts_process
-    
-    mx.set_wired_limit(42 * 1024**3)
+
+    try:
+        mx.set_wired_limit(42 * 1024**3)
+    except ValueError:
+        logging.warning("Unable to set wired limit. Using default.")
     
     for name, path in config.models.items():
         future = utils.inference_worker.submit(utils.load_model, name, path)
