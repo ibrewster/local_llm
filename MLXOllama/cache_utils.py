@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import functools
 import gc
 import httpx
 import json
@@ -17,13 +18,19 @@ import mlx.core as mx
 
 from aiocache import cached
 from cachetools import TTLCache
-from mlx_lm.models.cache import make_prompt_cache, save_prompt_cache, load_prompt_cache
+from mlx_lm.models.cache import (
+    make_prompt_cache,
+    save_prompt_cache,
+    load_prompt_cache,
+    LRUPromptCache
+)
 
 from . import utils, config
 from .utils import MCP_CLIENT, inference_worker
 
 static_caches = {}
-dynamic_caches = TTLCache(maxsize=8, ttl=172800)
+# dynamic_caches = TTLCache(maxsize=8, ttl=172800)
+dynamic_cache = LRUPromptCache()
 state_cache = {}
 itunes_cache = {}
 
@@ -31,60 +38,114 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 _background_tasks = set()
 
-
 HA_MARKER = "####HOME ASSISTANT REQUEST####"
 MORNING_MARKER = "#####MORNING#####"
 BEDTIME_MARKER = "###BEDTIME###"
 
-
 async def get_cache(model_info, messages, tools):
-    if len(messages) == 1:
-        return None, False # No system prompt to cache
-
-    # defaults
-    factory_fn = _build_cache
-    cache_hash = None
-    cache_store = dynamic_caches
-    # end defaults
-
     first_prompt = messages[0]['content']
 
     is_ha = HA_MARKER in first_prompt
 
+    tokenizer = model_info.tokenizer
+    model = model_info.model
+
+    apply_template = functools.partial(
+        tokenizer.apply_chat_template,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    
+    if len(messages) == 1:
+        return make_prompt_cache(model), tokenizer.encode(apply_template(messages)), is_ha
+
     matched = next((v for k, v in STATIC_CACHE_REGISTRY.items() if k in first_prompt), None)
-    if matched:
-        # This is a static cache
+
+    if matched is not None:
+        # Static cache path — system prompt is pre-cached, remaining tokens are messages[1:]
         cache_hash, factory_fn = matched
-        cache_store = static_caches
 
-    if cache_hash is None:
-        cache_key = str(first_prompt) + json.dumps(tools, sort_keys=True)
-        cache_hash = xxhash.xxh64(cache_key.encode()).hexdigest()
+        cache = static_caches.get(cache_hash)
+        if cache is None:
+            logging.info("Cache Miss (static)")
+            cache = await factory_fn(model_info, first_prompt, tools)
+        else:
+            logging.info("Cache Hit (static)")
 
-    cache = cache_store.get(cache_hash)
-    if cache is None:
-        logging.info("Cache Miss")
-        cache = await factory_fn(model_info, first_prompt, tools)
-    else:
-        logging.info("Cache Hit")
+        static_caches[cache_hash] = cache  # Bump TTL
 
-    # Bump the TTL
-    cache_store[cache_hash] = cache
-
-    if matched:
         task = asyncio.create_task(_save_static_caches())
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
 
-    return cache, is_ha
+        unprocessed_tokens = tokenizer.encode(apply_template(messages[1:]))
+
+    else:
+        # Dynamic path — delegate cache locality to LRUPromptCache
+        all_tokens = tokenizer.encode(apply_template(messages))
+        cache, unprocessed_tokens = dynamic_cache.fetch_nearest_cache(model, all_tokens)
+
+        if cache is None:
+            logging.info("Cache Miss (dynamic)")
+            cache = await _build_cache(model_info, first_prompt, tools)
+            unprocessed_tokens = tokenizer.encode(apply_template(messages[1:]))
+        else:
+            logging.info("Cache Hit (dynamic)")
+
+    return cache, unprocessed_tokens, is_ha
+
+
+# async def get_cache(model_info, messages, tools):
+#     if len(messages) == 1:
+#         return None, False # No system prompt to cache
+#
+#     # defaults
+#     factory_fn = _build_cache
+#     cache_hash = None
+#     cache_store = dynamic_caches
+#     # end defaults
+#
+#     first_prompt = messages[0]['content']
+#
+#     is_ha = HA_MARKER in first_prompt
+#
+#     #Check for something that uses one of our pre-filled static caches
+#     matched = next((v for k, v in STATIC_CACHE_REGISTRY.items() if k in first_prompt), None)
+#     if matched is not None:
+#         # This is a static cache
+#         cache_hash, factory_fn = matched
+#         cache_store = static_caches
+#
+#     if cache_hash is None:
+#         cache_key = str(first_prompt) + json.dumps(tools, sort_keys=True)
+#         cache_hash = xxhash.xxh64(cache_key.encode()).hexdigest()
+#
+#     cache = cache_store.get(cache_hash)
+#     if cache is None:
+#         logging.info("Cache Miss")
+#         cache = await factory_fn(model_info, first_prompt, tools)
+#     else:
+#         logging.info("Cache Hit")
+#
+#     # Bump the TTL
+#     cache_store[cache_hash] = cache
+#
+#     if matched:
+#         task = asyncio.create_task(_save_static_caches())
+#         _background_tasks.add(task)
+#         task.add_done_callback(_background_tasks.discard)
+#
+#     return cache, is_ha
 
 _cache_io_lock = asyncio.Lock()
+
 
 async def _save_static_caches():
     async with _cache_io_lock:
         future = inference_worker.submit(_save_caches)
         await asyncio.wrap_future(future)
 #        await asyncio.to_thread(_save_caches)
+
 
 def _save_caches():
     path: Path = Path(__file__).parent / "Caches"
@@ -102,11 +163,13 @@ def _save_caches():
     except Exception as e:
         logging.warning(f"Cache save failed (non-critical): {e}")
 
+
 async def _load_static_caches():
     async with _cache_io_lock:
         future = inference_worker.submit(_load_caches)
         await asyncio.wrap_future(future)
         #        await asyncio.to_thread(_load_caches)
+
 
 def _load_caches():
     path = Path(__file__).parent / "Caches"
@@ -119,6 +182,7 @@ def _load_caches():
             except Exception as e:
                 logging.warning(f"Failed to load cache {key[:16]}...: {e}")
 
+
 @dataclass
 class LiveEntity:
     names: list[str]
@@ -127,7 +191,8 @@ class LiveEntity:
     areas: list[str] = field(default_factory=list)
     attributes: dict = field(default_factory=dict)
 
-async def get_rest_data() ->list[dict]:
+
+async def get_rest_data() -> list[dict]:
     headers = {
         "Authorization": f"Bearer {config.HA_TOKEN}",
         "Content-Type": "application/json",
@@ -146,6 +211,7 @@ async def get_rest_data() ->list[dict]:
 
     return response.json()
 
+
 async def state_refresh_loop():
     """Runs forever, refreshing the entity state cache."""
     while True:
@@ -155,6 +221,7 @@ async def state_refresh_loop():
             logging.error(f"HA state refresh failed: {e}", exc_info=True)
 
         await asyncio.sleep(20)
+
 
 async def refresh_entity_states():
     entity_data = await get_rest_data()
@@ -185,8 +252,9 @@ async def refresh_entity_states():
 
         state_cache[entity_id] = entry
 
-@cached(ttl=21600) # six hours
-async def get_entity_ids() ->dict[str:str]:
+
+@cached(ttl=21600)  # six hours
+async def get_entity_ids() -> dict[str:str]:
     # Get more information on the entities from the REST api
     response = await get_rest_data()
 
@@ -196,7 +264,8 @@ async def get_entity_ids() ->dict[str:str]:
     }
     return friendly_to_id
 
-@cached(ttl=86400) # 24 hours
+
+@cached(ttl=86400)  # 24 hours
 async def get_live_context() -> list[LiveEntity]:
     ha_exposed_entities = await MCP_CLIENT.call_tool('homeassistant_GetLiveContext')
 
@@ -231,6 +300,7 @@ async def get_live_context() -> list[LiveEntity]:
 
     return entities
 
+
 def _build_entity(raw: dict) -> LiveEntity:
     names = [n.strip() for n in raw["names"].split(",")]
     areas = [a.strip() for a in raw.get("areas", "").split(",")] if raw.get("areas") else []
@@ -249,7 +319,7 @@ async def cache_refresh_loop():
     logging.info("Loading static caches from disk")
     await _load_static_caches()
 
-    #(re) create the bedtime cache
+    # (re) create the bedtime cache
     await create_bedtime_cache()
 
     # Create the Home Assistant cache if it wasn't loaded
@@ -260,14 +330,13 @@ async def cache_refresh_loop():
     else:
         speak_queue.put_nowait("UPDATE")
 
-
     TARGET_TIME = datetime.time(0, 30)  # 12:30 AM
     while True:
         now = datetime.datetime.now()
         target = datetime.datetime.combine(now.date(), TARGET_TIME)
 
         if target <= now:
-            target += datetime.timedelta(days=1) # roll to tomorrow
+            target += datetime.timedelta(days=1)  # roll to tomorrow
 
         seconds_until = (target - now).total_seconds()
 
@@ -296,19 +365,23 @@ async def itunes_cache_refresh():
         logging.info("iTunes cache refreshed")
         await asyncio.sleep(60 * 30)
 
+
 async def refresh_cache_background():
     cache = await create_ha_cache()
     static_caches['HA'] = cache
+
 
 @cached(ttl=86400)
 async def get_tools():
     mcp_tools = await MCP_CLIENT.list_tools()
     return mcp_tools
 
+
 async def _morning_cache_factory(*args, **kwargs):
     return await create_morning_cache("")
 
-async def create_morning_cache(news_prompt = ""):
+
+async def create_morning_cache(news_prompt=""):
     logging.info("Creating morning cache")
     t0 = time.time()
     system_prompt = (Path(__file__).parent / "Prompts" / "morning_system.txt").read_text()
@@ -318,6 +391,7 @@ async def create_morning_cache(news_prompt = ""):
     await _save_static_caches()
     logging.info(f"Created morning cache in {time.time() - t0}")
     return cache
+
 
 async def create_bedtime_cache(*args, **kwargs):
     logging.info(f"Creating bedtime cache")
@@ -396,6 +470,7 @@ async def create_ha_cache(*args, **kwargs):
 
     return cache
 
+
 async def _build_cache(model_info, system_prompt, tools, user_prompt=""):
     model = model_info['model']
     tokenizer = model_info['tokenizer']
@@ -429,6 +504,7 @@ async def _build_cache(model_info, system_prompt, tools, user_prompt=""):
 
     return cache
 
+
 async def _get_library_items(path):
     from .local_tools import ITUNES_URL
     offset = 0
@@ -436,7 +512,7 @@ async def _get_library_items(path):
     all_items = []
     async with httpx.AsyncClient() as client:
         while True:
-            response = await client.get(f"{ITUNES_URL}/library/{path}", params={"offset": offset, 'limit': limit,})
+            response = await client.get(f"{ITUNES_URL}/library/{path}", params={"offset": offset, 'limit': limit, })
             response.raise_for_status()
             data = response.json()
             all_items.append(data)
@@ -447,11 +523,12 @@ async def _get_library_items(path):
 
     return all_items
 
+
 async def create_iTunes_cache():
     # Walk through available albums
     all_albums = await _get_library_items('albums')
     all_albums = all_albums[0]['albums']
-    itunes_cache['albums']={a['name']:a for a in all_albums}
+    itunes_cache['albums'] = {a['name']: a for a in all_albums}
 
     all_artists = await _get_library_items('artists')
     all_artists = all_artists[0]['artists']
