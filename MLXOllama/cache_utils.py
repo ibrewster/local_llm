@@ -42,10 +42,12 @@ HA_MARKER = "####HOME ASSISTANT REQUEST####"
 MORNING_MARKER = "#####MORNING#####"
 BEDTIME_MARKER = "###BEDTIME###"
 
-async def get_cache(model_info, messages, tools):
+async def get_cache(model_info, messages, tools, thinking=True):
     first_prompt = messages[0]['content']
 
     is_ha = HA_MARKER in first_prompt
+    if is_ha:
+        thinking=False
 
     tokenizer = model_info.tokenizer
     model = model_info.model
@@ -53,11 +55,14 @@ async def get_cache(model_info, messages, tools):
     apply_template = functools.partial(
         tokenizer.apply_chat_template,
         tokenize=False,
-        add_generation_prompt=True
+        add_generation_prompt=True,
+        enable_thinking = thinking
     )
-    
-    if len(messages) == 1:
-        return make_prompt_cache(model), tokenizer.encode(apply_template(messages)), is_ha
+
+    all_tokens = tokenizer.encode(apply_template(messages, tools=tools))
+
+    if len(messages) == 1 or messages[0]['role'] != 'system':
+        return make_prompt_cache(model), all_tokens, all_tokens
 
     matched = next((v for k, v in STATIC_CACHE_REGISTRY.items() if k in first_prompt), None)
 
@@ -82,7 +87,6 @@ async def get_cache(model_info, messages, tools):
 
     else:
         # Dynamic path — delegate cache locality to LRUPromptCache
-        all_tokens = tokenizer.encode(apply_template(messages))
         cache, unprocessed_tokens = dynamic_cache.fetch_nearest_cache(model, all_tokens)
 
         if cache is None:
@@ -92,7 +96,7 @@ async def get_cache(model_info, messages, tools):
         else:
             logging.info("Cache Hit (dynamic)")
 
-    return cache, unprocessed_tokens, is_ha
+    return cache, unprocessed_tokens, all_tokens
 
 
 # async def get_cache(model_info, messages, tools):

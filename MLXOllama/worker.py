@@ -16,7 +16,7 @@ from typing import Any
 from mlx_lm import generate, stream_generate, sample_utils
 import mlx.core as mx
 
-from . import utils, config, local_tools, tts_queue
+from . import utils, config, local_tools, tts_queue, cache_utils
 from .cache_utils import get_cache
 from .utils import inference_worker
 
@@ -301,8 +301,9 @@ def speak_thread(speak_queue):
 class InferenceOptions:
     model: Any
     tokenizer: Any
-    formatted_prompt: str
+    prompt_tokens: list
     cache: Any
+    all_tokens:list
     
 async def setup_inference(
     message: list,
@@ -314,32 +315,16 @@ async def setup_inference(
     if model_info is None:
         model_info = utils.loaded_models[config.MAIN_MODEL]
     model = model_info['model']
-    tokenizer = model_info['tokenizer']    
+    tokenizer = model_info['tokenizer']
 
-    cache = None
-    if len(message) > 1 and message[0]['role'] == 'system':
-        cache, is_ha = await get_cache(model_info, message, tools)
-        if is_ha:
-            thinking = False
-            
-        if cache:
-            cache = copy.copy(cache)
-            message = message[1:]
-            tools = None
-    
-    formatted_prompt = tokenizer.apply_chat_template(
-        message,
-        tools=tools, 
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=thinking
-    )
-    
+    cache, unprocessed_tokens, all_tokens = await get_cache(model_info, message, tools, thinking)
+    cache = copy.copy(cache)
     return InferenceOptions(
         model,
         tokenizer,
-        formatted_prompt,
-        cache
+        unprocessed_tokens,
+        cache,
+        all_tokens
     )
     
 def submit_inference(
@@ -362,8 +347,9 @@ def submit_inference(
     def thread_worker():
         model = opts.model
         tokenizer = opts.tokenizer
-        formatted_prompt = opts.formatted_prompt
+        formatted_prompt = opts.prompt_tokens
         cache = opts.cache
+        all_tokens=opts.all_tokens
         try:
             with utils.mlx_inference_lock:
                 # This runs in a worker thread
@@ -377,7 +363,13 @@ def submit_inference(
                     max_kv_size=max_kv_size
                 ):
                     put((response.text, response.token, False, None))
-                    
+                    all_tokens.append(response.token)
+
+                cache_utils.dynamic_cache.insert_cache(
+                    opts.model,
+                    all_tokens,
+                    cache
+                )
             put(("", None, True, None))
 
         except Exception as e:
@@ -457,8 +449,9 @@ async def _stream_tokens(
             xtc_threshold=0.1
         )
 
-        formatted_prompt = opts.formatted_prompt
+        prompt_tokens=opts.prompt_tokens
         tokenizer = opts.tokenizer
+        formatted_prompt = tokenizer.decode(prompt_tokens)
 
         if formatted_prompt.strip().endswith("<think>"):
             yield "<think>\n", False, None
