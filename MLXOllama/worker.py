@@ -102,18 +102,28 @@ alaskan_content = {
     ]
 }
 
-
+WEEKLY_STYLES = {
+    "Monday": "the gentle, repetitive, and reassuring style of 'Goodnight Moon'",
+    "Tuesday": "the soft, comforting style of a classic woodland animal bedtime tale",
+    "Wednesday": "the dreamy, celestial style of a poem about the night sky and drifting stars",
+    "Thursday": "the warm, rustic style of a cozy fireside cabin settling down for a long winter night",
+    "Friday": "the quiet, whispering style of gentle snowfall blanketed over the quiet woods",
+    "Saturday": "the peaceful style of a tired traveler or musher resting by a calm, frozen river",
+    "Sunday": "the lulling, melodic style of a soft northern breeze singing the trees to sleep"
+}
 
 def gen_goodnight(prompt):
     t0 = time.time()
     logging.info("Goodnight generation beginning")
-    # client=genai.Client(api_key=config.GOOGLE_API_KEY)
-
+    
     current_month = datetime.datetime.now().strftime("%B")
     day_of_year = datetime.datetime.now().timetuple().tm_yday
 
     category_pick = random.choice(list(alaskan_content.keys()))
     item_pick, item_description = random.choice(alaskan_content[category_pick])
+
+    today_name = datetime.now().strftime("%A")
+    style_pick = WEEKLY_STYLES[today_name]
 
 
     dynamic_info = f"""
@@ -122,6 +132,7 @@ SPECIAL_ITEM = {item_pick}
 ITEM_DESCRIPTION = {item_description}
 The day of the year is: {day_of_year}
 CURRENT_MONTH = {current_month}
+POEM_STYLE = {style_pick}
 -------------------"""
 
     message = [
@@ -352,6 +363,7 @@ def submit_inference(
         all_tokens=opts.all_tokens
         try:
             with utils.mlx_inference_lock:
+                mx.random.seed(int(time.time()))
                 # This runs in a worker thread
                 for response in stream_generate(
                     model,
