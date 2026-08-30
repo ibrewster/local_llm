@@ -78,6 +78,10 @@ async def get_cache(model_info, messages, tools):
 
     return cache, is_ha
 
+def make_cache_key(model_name: str, messages: list) -> str:
+    content = model_name + "".join(m["content"] for m in messages)
+    return xxhash.xxh64(content.encode()).hexdigest()
+    
 _cache_io_lock = asyncio.Lock()
 
 async def _save_static_caches():
