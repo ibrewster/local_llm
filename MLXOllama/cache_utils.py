@@ -49,8 +49,9 @@ async def get_cache(model_info, messages, tools, thinking=True):
     if is_ha:
         thinking=False
 
-    tokenizer = model_info.tokenizer
-    model = model_info.model
+    tokenizer = model_info["tokenizer"]
+    model = model_info["model"]
+    model_name = model_info["name"]
 
     apply_template = functools.partial(
         tokenizer.apply_chat_template,
@@ -59,10 +60,18 @@ async def get_cache(model_info, messages, tools, thinking=True):
         enable_thinking = thinking
     )
 
+    base_template = functools.partial(
+        tokenizer.apply_chat_template,
+        tokenize=False,
+        add_generation_prompt=False,
+        enable_thinking = thinking
+    )
+
     all_tokens = tokenizer.encode(apply_template(messages, tools=tools))
+    base_tokens = tokenizer.encode(base_template(messages, tools=tools), add_special_tokens=False)
 
     if len(messages) == 1 or messages[0]['role'] != 'system':
-        return make_prompt_cache(model), all_tokens, all_tokens
+        return make_prompt_cache(model), all_tokens, base_tokens
 
     matched = next((v for k, v in STATIC_CACHE_REGISTRY.items() if k in first_prompt), None)
 
@@ -87,7 +96,7 @@ async def get_cache(model_info, messages, tools, thinking=True):
 
     else:
         # Dynamic path — delegate cache locality to LRUPromptCache
-        cache, unprocessed_tokens = dynamic_cache.fetch_nearest_cache(model, all_tokens)
+        cache, unprocessed_tokens = dynamic_cache.fetch_nearest_cache(model_name, all_tokens)
 
         if cache is None:
             logging.info("Cache Miss (dynamic)")
@@ -96,50 +105,7 @@ async def get_cache(model_info, messages, tools, thinking=True):
         else:
             logging.info("Cache Hit (dynamic)")
 
-    return cache, unprocessed_tokens, all_tokens
-
-
-# async def get_cache(model_info, messages, tools):
-#     if len(messages) == 1:
-#         return None, False # No system prompt to cache
-#
-#     # defaults
-#     factory_fn = _build_cache
-#     cache_hash = None
-#     cache_store = dynamic_caches
-#     # end defaults
-#
-#     first_prompt = messages[0]['content']
-#
-#     is_ha = HA_MARKER in first_prompt
-#
-#     #Check for something that uses one of our pre-filled static caches
-#     matched = next((v for k, v in STATIC_CACHE_REGISTRY.items() if k in first_prompt), None)
-#     if matched is not None:
-#         # This is a static cache
-#         cache_hash, factory_fn = matched
-#         cache_store = static_caches
-#
-#     if cache_hash is None:
-#         cache_key = str(first_prompt) + json.dumps(tools, sort_keys=True)
-#         cache_hash = xxhash.xxh64(cache_key.encode()).hexdigest()
-#
-#     cache = cache_store.get(cache_hash)
-#     if cache is None:
-#         logging.info("Cache Miss")
-#         cache = await factory_fn(model_info, first_prompt, tools)
-#     else:
-#         logging.info("Cache Hit")
-#
-#     # Bump the TTL
-#     cache_store[cache_hash] = cache
-#
-#     if matched:
-#         task = asyncio.create_task(_save_static_caches())
-#         _background_tasks.add(task)
-#         task.add_done_callback(_background_tasks.discard)
-#
-#     return cache, is_ha
+    return cache, unprocessed_tokens, base_tokens
 
 def make_cache_key(model_name: str, messages: list) -> str:
     content = model_name + "".join(m["content"] for m in messages)
@@ -147,12 +113,10 @@ def make_cache_key(model_name: str, messages: list) -> str:
     
 _cache_io_lock = asyncio.Lock()
 
-
 async def _save_static_caches():
     async with _cache_io_lock:
         future = inference_worker.submit(_save_caches)
         await asyncio.wrap_future(future)
-#        await asyncio.to_thread(_save_caches)
 
 
 def _save_caches():

@@ -321,6 +321,7 @@ class InferenceOptions:
     prompt_tokens: list
     cache: Any
     all_tokens:list
+    model_name: str
 
 async def setup_inference(
     message: list,
@@ -341,7 +342,8 @@ async def setup_inference(
         tokenizer,
         unprocessed_tokens,
         cache,
-        all_tokens
+        all_tokens,
+        model_info['name']
     )
     
 def submit_inference(
@@ -381,10 +383,9 @@ def submit_inference(
                     max_kv_size=max_kv_size
                 ):
                     put((response.text, response.token, False, None))
-                    all_tokens.append(response.token)
 
                 cache_utils.dynamic_cache.insert_cache(
-                    opts.model,
+                    opts.model_name,
                     all_tokens,
                     cache
                 )
@@ -549,7 +550,7 @@ async def _stream_tokens(
         state['context'] = tokenizer.encode(formatted_prompt) + full_output_tokens
         state['eval_count'] = len(tokenizer.encode(formatted_prompt))
     except Exception as e:
-        logging.error(f"Unable to generate output ({e})")
+        logging.exception(f"Unable to generate output ({e})")
         state['context'] = None
         state['eval_count'] = 0
 
