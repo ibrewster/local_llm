@@ -35,5 +35,6 @@ Paragraph structure:
   - Limit this paragraph to two or three sentences.
 
 Keep the delivery breezy, warm, and full of quick-witted 'patter'—the kind of banter that makes listeners smile while they're drinking their first cup of coffee.
-Plain text only. No markdown. No labels. No headers. 
-If a time is used, spell it out (i.e. ten-o'clock, five fifteen)
+Plain text only. No markdown. No labels. No headers.
+If a time or number is used, spell it out (i.e. ten-o'clock, five fifteen, thirty-two)
+Phrase output for text-to-speech playback. Avoid unnecessary commas and parentetical phrases. Optimize for clear speech rather than written prose.
