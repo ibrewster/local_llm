@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import datetime
-import gc
 import json
 import logging
 import queue
@@ -11,12 +10,12 @@ import re
 import traceback
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from mlx_lm import generate, stream_generate, sample_utils
 import mlx.core as mx
 
-from . import utils, config, local_tools, tts_queue
+from . import utils, config, local_tools, tts_queue, cache_utils
 from .cache_utils import get_cache
 from .utils import inference_worker
 
@@ -102,12 +101,19 @@ alaskan_content = {
     ]
 }
 
-
+WEEKLY_STYLES = {
+    "Monday": "the gentle, repetitive, and reassuring style of 'Goodnight Moon'",
+    "Tuesday": "the soft, comforting style of a classic woodland animal bedtime tale",
+    "Wednesday": "the dreamy, celestial style of a poem about the night sky and drifting stars",
+    "Thursday": "the warm, rustic style of a cozy fireside cabin settling down for a long winter night",
+    "Friday": "the quiet, whispering style of gentle snowfall blanketed over the quiet woods",
+    "Saturday": "the peaceful style of a tired traveler or musher resting by a calm, frozen river",
+    "Sunday": "the lulling, melodic style of a soft northern breeze singing the trees to sleep"
+}
 
 def gen_goodnight(prompt):
     t0 = time.time()
     logging.info("Goodnight generation beginning")
-    # client=genai.Client(api_key=config.GOOGLE_API_KEY)
 
     current_month = datetime.datetime.now().strftime("%B")
     day_of_year = datetime.datetime.now().timetuple().tm_yday
@@ -115,6 +121,10 @@ def gen_goodnight(prompt):
     category_pick = random.choice(list(alaskan_content.keys()))
     logging.info(f"Selected category for goodnight content: {category_pick}")
     item_pick, item_description = random.choice(alaskan_content[category_pick])
+
+    today_name = datetime.datetime.now().strftime("%A")
+    style_pick = WEEKLY_STYLES[today_name]
+
     logging.info(f"Selected item for goodnight content: {item_pick} - {item_description}")
 
     dynamic_info = f"""
@@ -123,6 +133,7 @@ SPECIAL_ITEM = {item_pick}
 ITEM_DESCRIPTION = {item_description}
 The day of the year is: {day_of_year}
 CURRENT_MONTH = {current_month}
+POEM_STYLE = {style_pick}
 -------------------"""
 
     message = [
@@ -135,7 +146,7 @@ CURRENT_MONTH = {current_month}
         top_p=0.92
     )
 
-    token_queue: queue.Queue = submit_inference_job(message, sampler=sampler)
+    token_queue: queue.Queue = cast(queue.Queue, submit_inference_job(message, sampler=sampler))
     
     remainder = ""
     body_sentences = []
@@ -196,7 +207,7 @@ def speak_thread(speak_queue):
             if isinstance(msg, tuple):
                 system, prompt = msg
             else:
-                system: str = None
+                system: str|None = None
                 prompt: str = msg
 
             if prompt == "QUIT":
@@ -226,14 +237,16 @@ def speak_thread(speak_queue):
 
             try:
                 buffer = ""
-                token_queue = submit_inference_job( # Submits to another, dedicated, inference thread
-                    message,
-                    thinking=use_thinking,
-                    sampler=utils.FUN_SAMPLER,
-                    max_kv_size=2048, 
-                    max_tokens=4096
+                token_queue: queue.Queue = cast(
+                    queue.Queue,
+                    submit_inference_job( # Submits to another, dedicated, inference thread
+                        message,
+                        thinking=use_thinking,
+                        sampler=utils.FUN_SAMPLER,
+                        max_kv_size=2048,
+                        max_tokens=4096)
                 )
-                
+
                 is_thinking = False
                 sentence_count = 0
                 while True:
@@ -286,7 +299,7 @@ def speak_thread(speak_queue):
                         sentence_count += 1
                         logging.debug(complete.strip())
                         tts_queue.put(complete.strip())
-                        
+
                     if is_done: # failsafe, but we shouldn't get here.
                         break
 
@@ -305,9 +318,10 @@ def speak_thread(speak_queue):
 class InferenceOptions:
     model: Any
     tokenizer: Any
-    formatted_prompt: str
+    prompt_tokens: list
     cache: Any
-    
+    all_tokens:list
+
 async def setup_inference(
     message: list,
     *,
@@ -318,32 +332,16 @@ async def setup_inference(
     if model_info is None:
         model_info = utils.loaded_models[config.MAIN_MODEL]
     model = model_info['model']
-    tokenizer = model_info['tokenizer']    
+    tokenizer = model_info['tokenizer']
 
-    cache = None
-    if len(message) > 1 and message[0]['role'] == 'system':
-        cache, is_ha = await get_cache(model_info, message, tools)
-        if is_ha:
-            thinking = False
-            
-        if cache:
-            cache = copy.copy(cache)
-            message = message[1:]
-            tools = None
-    
-    formatted_prompt = tokenizer.apply_chat_template(
-        message,
-        tools=tools, 
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=thinking
-    )
-    
+    cache, unprocessed_tokens, all_tokens = await get_cache(model_info, message, tools, thinking)
+    cache = copy.copy(cache)
     return InferenceOptions(
         model,
         tokenizer,
-        formatted_prompt,
-        cache
+        unprocessed_tokens,
+        cache,
+        all_tokens
     )
     
 def submit_inference(
@@ -351,7 +349,7 @@ def submit_inference(
     *, 
     sampler=None,
     max_kv_size=None,
-    max_tokens=None,
+    max_tokens:int = 256, # Default from mlx_lm
     loop: asyncio.AbstractEventLoop | None = None    
 ) -> queue.Queue | asyncio.Queue:
     
@@ -366,10 +364,12 @@ def submit_inference(
     def thread_worker():
         model = opts.model
         tokenizer = opts.tokenizer
-        formatted_prompt = opts.formatted_prompt
+        formatted_prompt = opts.prompt_tokens
         cache = opts.cache
+        all_tokens=opts.all_tokens
         try:
             with utils.mlx_inference_lock:
+                mx.random.seed(int(time.time()))
                 # This runs in a worker thread
                 for response in stream_generate(
                     model,
@@ -381,7 +381,13 @@ def submit_inference(
                     max_kv_size=max_kv_size
                 ):
                     put((response.text, response.token, False, None))
-                    
+                    all_tokens.append(response.token)
+
+                cache_utils.dynamic_cache.insert_cache(
+                    opts.model,
+                    all_tokens,
+                    cache
+                )
             put(("", None, True, None))
 
         except Exception as e:
@@ -397,7 +403,7 @@ def submit_inference_job(
     thinking=False,
     sampler=None,
     max_kv_size=None,
-    max_tokens=None,
+    max_tokens:int=256, # Default from mlx-lm
     loop: asyncio.AbstractEventLoop | None = None
 ) -> queue.Queue | asyncio.Queue:
     opts = asyncio.run(setup_inference(message, tools=tools, thinking=thinking))
@@ -438,8 +444,8 @@ Good morning! Today is a clear day with scheduled tasks. Please review the upcom
 
         if time.time() - t1 > 10:
             logging.warning(f"Dummy inference for {mod_name} took {time.time() - t1:.2f} seconds, which is quite long. Running a full refresh inference to keep the model warm.")
-            full_refresh_model(mod_name, mod_info);
-        
+            full_refresh_model(mod_name, mod_info)
+
         logging.info(f"Ran keep-alive inference for {mod_name} in {time.time() - t1}")
 
 def full_refresh_model(mod_name, mod_info):
@@ -455,13 +461,13 @@ def full_refresh_model(mod_name, mod_info):
 
     future = inference_worker.submit(thread_worker)
     future.result()
-    
+
     logging.info(f"Ran full refresh inference for {mod_name} in {time.time() - t1}")
 
 async def _stream_tokens(
-    model_info: dict, msg_history: str,
-    options: dict, state: dict=None,
-    tools: list = None,
+    model_info: dict, msg_history: list[dict],
+    options: dict, state: dict|None=None,
+    tools: list|None = None,
     think: bool = False
 ):
     """
@@ -469,6 +475,9 @@ async def _stream_tokens(
     Runs MLX in a thread to avoid blocking the event loop.
     Adapt this to however your existing pipeline streams tokens.
     """
+    if state is None:
+        state = {}
+
     t0 = time.time_ns()
     eval_count = 0
     try:
@@ -492,8 +501,9 @@ async def _stream_tokens(
             xtc_threshold=0.1
         )
 
-        formatted_prompt = opts.formatted_prompt
+        prompt_tokens=opts.prompt_tokens
         tokenizer = opts.tokenizer
+        formatted_prompt = tokenizer.decode(prompt_tokens)
 
         if formatted_prompt.strip().endswith("<think>"):
             yield "<think>\n", False, None
@@ -510,11 +520,13 @@ async def _stream_tokens(
         full_output_tokens = []
         
         loop = asyncio.get_running_loop()
-        token_queue: asyncio.Queue = submit_inference(
-            opts,
-            sampler=sampler,
-            max_tokens=safe_max,
-            loop=loop
+        token_queue: asyncio.Queue = cast(
+            asyncio.Queue,
+            submit_inference(
+                opts,
+                sampler=sampler,
+                max_tokens=safe_max,
+                loop=loop)
         )
 
         while True:
@@ -717,7 +729,7 @@ async def generate_stream(stream, model_info, msg_history, options,
         "eval_duration": stats.get("eval_duration") if stats else None,
         "prompt_eval_count": state.get('eval_count', 0),
         "prompt_eval_duration": 0,
-        "total_duration": int(total_time),
+        "total_duration": total_time,
         "load_duration": 0,
     }
     assistant_resp = {"role": "assistant", "content": full_text}

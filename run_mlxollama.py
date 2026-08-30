@@ -44,6 +44,9 @@ if __name__ == "__main__":
     
     MLXOllama.setup_app()
 
+    if MLXOllama.app is None:
+        raise RuntimeError("APP initilization failed. MLXOllama.app is None")
+
     asyncio.run(serve(MLXOllama.app, hconfig))    
 
     MLXOllama.app.logger.info("Server shutting down")
