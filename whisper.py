@@ -2,6 +2,8 @@ import asyncio
 import logging
 import time
 
+from typing import Any
+
 import numpy as np
 import mlx_whisper
 
@@ -62,6 +64,7 @@ def run_whisper_process():
                 wyoming_info,
                 WHISPER_MODEL,
                 WHISPER_LANGUAGE,
+                None,
                 *args,
                 **kwargs
             )
