@@ -21,6 +21,33 @@ from .cache_utils import get_cache
 from .utils import inference_worker
 
 alaskan_content = {
+    "Alaskan Animals": [
+        ("Grizzly Bear", "a massive brown bear often found fishing for salmon"),
+        ("Grey Wolf", "a social apex predator that hunts in the vast wilderness"),
+        ("Moose", "the largest member of the deer family with massive palmate antlers"),
+        ("Bald Eagle", "a white-headed bird of prey common along the coast"),
+        ("Orca", "the black-and-white 'killer whale' found in Alaskan fjords"),
+        ("Caribou", "the arctic deer known for long-distance migrations"),
+        ("Lynx", "a silent feline with tufted ears and large paws for snow"),
+        ("Humpback Whale", "a massive marine mammal known for breaching and singing"),
+        ("Dall Sheep", "a white, thin-horned sheep found on high mountain ridges"),
+        ("Wolverine", "a small but incredibly fierce and solitary forest predator"),
+        ("Musk Ox", "a prehistoric-looking herbivore with long, shaggy hair"),
+        ("Sea Otter", "a furry marine mammal that floats on its back in kelp forests"),
+        ("Puffin", "a colorful sea bird with a bright orange beak"),
+        ("Walrus", "a heavy marine mammal with long ivory tusks"),
+        ("Arctic Fox", "a small fox whose coat turns white in the winter"),
+        ("Steller Sea Lion", "a massive, roaring pinniped found on rocky haul-outs"),
+        ("Snowshoe Hare", "a rabbit whose fur changes color with the seasons"),
+        ("Ptarmigan", "the state bird of Alaska, known for its feathered feet"),
+        ("Beluga Whale", "a small, white whale found in the Cook Inlet"),
+        ("Porpoise", "a fast-swimming black and white marine mammal"),
+        ("Marmot", "a large ground squirrel found in rocky alpine areas"),
+        ("Sitka Black-tailed Deer", "a small deer native to the rainforests of Southeast"),
+        ("Mountain Goat", "a sure-footed white climber of the steep coastal peaks"),
+        ("Harbor Seal", "a common, spotted seal often seen resting on ice floes"),
+        ("Porcupine", "a slow-moving rodent covered in sharp defensive quills")
+    ],
     "Alaskan Lifestyle Object": [
         ("Ulu", "a curved knife with a caribou antler handle used for subsistence"),
         ("Totem Pole", "a tall cedar monument carved with ancestral figures"),
@@ -72,33 +99,6 @@ alaskan_content = {
         ("Lichen-dyed Blanket", "a wool blanket colored with dyes made from tundra moss"),
         ("Copper Earrings", "hand-hammered jewelry reflecting ancient metalworking"),
         ("Float Plane Model", "a miniature de Havilland Beaver or bush plane")
-    ],
-    "Alaskan Animals": [
-        ("Grizzly Bear", "a massive brown bear often found fishing for salmon"),
-        ("Grey Wolf", "a social apex predator that hunts in the vast wilderness"),
-        ("Moose", "the largest member of the deer family with massive palmate antlers"),
-        ("Bald Eagle", "a white-headed bird of prey common along the coast"),
-        ("Orca", "the black-and-white 'killer whale' found in Alaskan fjords"),
-        ("Caribou", "the arctic deer known for long-distance migrations"),
-        ("Lynx", "a silent feline with tufted ears and large paws for snow"),
-        ("Humpback Whale", "a massive marine mammal known for breaching and singing"),
-        ("Dall Sheep", "a white, thin-horned sheep found on high mountain ridges"),
-        ("Wolverine", "a small but incredibly fierce and solitary forest predator"),
-        ("Musk Ox", "a prehistoric-looking herbivore with long, shaggy hair"),
-        ("Sea Otter", "a furry marine mammal that floats on its back in kelp forests"),
-        ("Puffin", "a colorful sea bird with a bright orange beak"),
-        ("Walrus", "a heavy marine mammal with long ivory tusks"),
-        ("Arctic Fox", "a small fox whose coat turns white in the winter"),
-        ("Steller Sea Lion", "a massive, roaring pinniped found on rocky haul-outs"),
-        ("Snowshoe Hare", "a rabbit whose fur changes color with the seasons"),
-        ("Ptarmigan", "the state bird of Alaska, known for its feathered feet"),
-        ("Beluga Whale", "a small, white whale found in the Cook Inlet"),
-        ("Porpoise", "a fast-swimming black and white marine mammal"),
-        ("Marmot", "a large ground squirrel found in rocky alpine areas"),
-        ("Sitka Black-tailed Deer", "a small deer native to the rainforests of Southeast"),
-        ("Mountain Goat", "a sure-footed white climber of the steep coastal peaks"),
-        ("Harbor Seal", "a common, spotted seal often seen resting on ice floes"),
-        ("Porcupine", "a slow-moving rodent covered in sharp defensive quills")
     ]
 }
 
@@ -113,8 +113,9 @@ def gen_goodnight(prompt):
     day_of_year = datetime.datetime.now().timetuple().tm_yday
 
     category_pick = random.choice(list(alaskan_content.keys()))
+    logging.info(f"Selected category for goodnight content: {category_pick}")
     item_pick, item_description = random.choice(alaskan_content[category_pick])
-
+    logging.info(f"Selected item for goodnight content: {item_pick} - {item_description}")
 
     dynamic_info = f"""
 ### INPUT DATA
@@ -186,114 +187,117 @@ def speak_thread(speak_queue):
         # gc.collect()
         # mx.clear_cache()
         try:
-            msg = speak_queue.get(timeout=300) # 5 minutes
-        except queue.Empty:
-            run_dummy_inference()
-            continue
+            try:
+                msg = speak_queue.get(timeout=300) # 5 minutes
+            except queue.Empty:
+                run_dummy_inference()
+                continue
 
-        if isinstance(msg, tuple):
-            system, prompt = msg
-        else:
-            system: str = None
-            prompt: str = msg
+            if isinstance(msg, tuple):
+                system, prompt = msg
+            else:
+                system: str = None
+                prompt: str = msg
 
-        if prompt == "QUIT":
-            break
-        if prompt == "UPDATE":
-            run_dummy_inference()
-            continue
+            if prompt == "QUIT":
+                break
+            if prompt == "UPDATE":
+                run_dummy_inference()
+                continue
 
-        ############ Bedtime Message ###################
-        if prompt.startswith("It is bedtime"):
-            gen_goodnight(prompt)
-            continue
-        ################################################
+            ############ Bedtime Message ###################
+            if prompt.startswith("It is bedtime"):
+                gen_goodnight(prompt)
+                continue
+            ################################################
 
-        t1=time.time()
-        use_thinking = prompt.startswith("/think")
-        clean_prompt = prompt.replace("/think", "").strip()
+            t1=time.time()
+            use_thinking = prompt.startswith("/think")
+            clean_prompt = prompt.replace("/think", "").strip()
 
-        message = [
-            {"role": "user","content": clean_prompt,}
-        ]
-
-        if system:
             message = [
-                {"role": "system","content": system}
-            ] + message
+                {"role": "user","content": clean_prompt,}
+            ]
 
-        try:
-            buffer = ""
-            token_queue = submit_inference_job(
-                message,
-                thinking=use_thinking,
-                sampler=utils.FUN_SAMPLER,
-                max_kv_size=2048, 
-                max_tokens=4096
-            )
-            
-            is_thinking = False
-            sentence_count = 0
-            while True:
-                result = token_queue.get()
-                token_text, token, is_done, err = result
-                if err:
-                    logging.error(f"Unable to generate result: {err}")
-                    buffer = "I'm sorry, but an error occured. Please check the logs for more information."
-                    break
+            if system:
+                message = [
+                    {"role": "system","content": system}
+                ] + message
 
-                # Check for state changes
-                if "<think>" in token_text or '<channel|>' in token_text:
-                    is_thinking = True
-                    # Strip the tag itself if it's bundled with other text
-                    token_text = token_text.replace("<think>", "")
-                    token_text = token_text.replace('<channel|>', "")
-
-                if "</think>" in token_text or '<|channel>' in token_text:
-                    is_thinking = False
-                    # Strip the tag and continue—only text AFTER this is the 'answer'
-                    token_text = token_text.split("<|channel>")[-1]
-                    if not token_text:
-                        continue
-
-                # If the model is currently 'thinking', skip sending to buffer/TTS
-                if is_thinking:
-                    continue
-
-                content = token_text
-                if not content:
-                    if is_done:
+            try:
+                buffer = ""
+                token_queue = submit_inference_job( # Submits to another, dedicated, inference thread
+                    message,
+                    thinking=use_thinking,
+                    sampler=utils.FUN_SAMPLER,
+                    max_kv_size=2048, 
+                    max_tokens=4096
+                )
+                
+                is_thinking = False
+                sentence_count = 0
+                while True:
+                    result = token_queue.get()
+                    token_text, token, is_done, err = result
+                    if err:
+                        logging.error(f"Unable to generate result: {err}")
+                        buffer = "I'm sorry, but an error occured. Please check the logs for more information."
                         break
-                    else:
+
+                    # Check for state changes
+                    if "<think>" in token_text or '<channel|>' in token_text:
+                        is_thinking = True
+                        # Strip the tag itself if it's bundled with other text
+                        token_text = token_text.replace("<think>", "")
+                        token_text = token_text.replace('<channel|>', "")
+
+                    if "</think>" in token_text or '<|channel>' in token_text:
+                        is_thinking = False
+                        # Strip the tag and continue—only text AFTER this is the 'answer'
+                        token_text = token_text.split("<|channel>")[-1]
+                        if not token_text:
+                            continue
+
+                    # If the model is currently 'thinking', skip sending to buffer/TTS
+                    if is_thinking:
                         continue
-                buffer += content
 
-                pattern = utils.sentence_endings_conservative if sentence_count < 2 else utils.paragraph_split
-                matches = list(pattern.finditer(buffer))
+                    content = token_text
+                    if not content:
+                        if is_done:
+                            break
+                        else:
+                            continue
+                    buffer += content
 
-                if matches:
-                    last_match = matches[-1]
-                    split_point = last_match.end()
+                    pattern = utils.sentence_endings_conservative if sentence_count < 2 else utils.paragraph_split
+                    matches = list(pattern.finditer(buffer))
 
-                    complete = buffer[:split_point]
-                    buffer = buffer[split_point:]
+                    if matches:
+                        last_match = matches[-1]
+                        split_point = last_match.end()
 
-                    if sentence_count == 0:
-                        logging.info(f"Mode: {'Reasoning' if use_thinking else 'Instant'}")
-                        logging.info(f"Time to first sentence: {time.time()-t1}")
-                    sentence_count += 1
-                    logging.debug(complete.strip())
-                    tts_queue.put(complete.strip())
-                    
-                if is_done: # failsafe, but we shouldn't get here.
-                    break
+                        complete = buffer[:split_point]
+                        buffer = buffer[split_point:]
 
-            # Flush remaining text
-            if buffer:
-                tts_queue.put(buffer)
-        finally:
-            tts_queue.put("__FLUSH__")
-            logging.info(f"Completed inference in {time.time() - t1}")
+                        if sentence_count == 0:
+                            logging.info(f"Mode: {'Reasoning' if use_thinking else 'Instant'}")
+                            logging.info(f"Time to first sentence: {time.time()-t1}")
+                        sentence_count += 1
+                        logging.debug(complete.strip())
+                        tts_queue.put(complete.strip())
+                        
+                    if is_done: # failsafe, but we shouldn't get here.
+                        break
+
+                # Flush remaining text
+                if buffer:
+                    tts_queue.put(buffer)
+            finally:
+                tts_queue.put("__FLUSH__")
+                logging.info(f"Completed inference in {time.time() - t1}")
+        except Exception as e:
+            logging.exception(f"Error in speak thread: {e}")
 
     logging.info("Prompt processing thread exited")
 
@@ -395,7 +399,7 @@ def submit_inference_job(
     max_kv_size=None,
     max_tokens=None,
     loop: asyncio.AbstractEventLoop | None = None
-) -> queue.Queue:
+) -> queue.Queue | asyncio.Queue:
     opts = asyncio.run(setup_inference(message, tools=tools, thinking=thinking))
     return submit_inference(
         opts,
@@ -409,19 +413,50 @@ def run_dummy_inference():
     """Run the fastest possible inference, just to keep things alive/in ram"""
     for mod_name, mod_info in utils.loaded_models.items():
         model = mod_info['model']
+        tokenizer= mod_info['tokenizer']
         t1 = time.time()
+
+        WARMUP_PROMPT = """
+{"domain": "home_automation", "action": "set_device", "entity_id": "light.living_room", "state": "on"} 
+Good morning! Today is a clear day with scheduled tasks. Please review the upcoming calendar events and summarize the weather forecast.
+"""
 
         def thread_worker():
             with utils.mlx_inference_lock:
-                dummy = mx.zeros((1, 1), dtype=mx.int32)
-                logits = model(dummy)
-                mx.eval(logits)
+                generate(
+                    model,
+                    tokenizer,
+                    prompt=WARMUP_PROMPT,
+                    max_tokens=1,
+                    verbose=False,
+                )
+
+                mx.synchronize()
         future = inference_worker.submit(thread_worker)
         
         future.result()
+
+        if time.time() - t1 > 10:
+            logging.warning(f"Dummy inference for {mod_name} took {time.time() - t1:.2f} seconds, which is quite long. Running a full refresh inference to keep the model warm.")
+            full_refresh_model(mod_name, mod_info);
         
         logging.info(f"Ran keep-alive inference for {mod_name} in {time.time() - t1}")
 
+def full_refresh_model(mod_name, mod_info):
+    """Run a full inference to refresh the model in memory. This is more intensive than the dummy, but can help with performance after an extended idle period."""
+    model = mod_info['model']
+    tokenizer = mod_info['tokenizer']
+    t1 = time.time()
+
+    def thread_worker():
+        with utils.mlx_inference_lock:
+            mx.eval(model.parameters())
+            mx.synchronize()
+
+    future = inference_worker.submit(thread_worker)
+    future.result()
+    
+    logging.info(f"Ran full refresh inference for {mod_name} in {time.time() - t1}")
 
 async def _stream_tokens(
     model_info: dict, msg_history: str,
