@@ -21,6 +21,7 @@ import mlx.core as mx
 from cachetools import TTLCache
 from huggingface_hub import snapshot_download
 from mlx_vlm import sample_utils, load
+from mlx_vlm.utils import load_config
 
 from . import config, mcp_client
 
@@ -403,13 +404,14 @@ def is_tool_response_request(messages: list) -> bool:
 
 def load_model(name, path):
     logging.info(f"Loading {name}")
-    model, tokenizer, model_config= load(path, return_config=True)
+    model, processor = load(path)
+    model_config = load_config(path)
 
     model_bytes = sum(x.nbytes for _, x in mx_utils.tree_flatten(model.parameters()))
     
     loaded_models[name] = {
         "model": model,
-        "tokenizer": tokenizer,
+        "processor": processor,
         "config": model_config,
         "repo_id": path,
         "name": name,
