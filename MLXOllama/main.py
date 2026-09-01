@@ -62,7 +62,7 @@ async def list_models():
             "id": model_info['name'],
             'object': "model",
             "created": 1690000000,
-            "owned_by": "mlx-lm",
+            "owned_by": "mlx-vlm",
         }
         models.append(model)
         
@@ -84,7 +84,7 @@ async def api_show():
     return quart.jsonify({
         "modelfile": f"FROM {model_info['repo_id']}",
         "parameters": f"num_predict {model_config.get('max_position_embeddings', 2048)}\ntemperature 0.7",
-        "template": model_info['tokenizer'].chat_template,
+        "template": model_info['processor'].tokenizer.chat_template,
         "details": utils.model_details(model_info['name']),
         "model_info": {
             "general.architecture": model_config.get("model_type"),

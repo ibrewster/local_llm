@@ -12,7 +12,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, cast
 
-from mlx_lm import generate, stream_generate, sample_utils
+from mlx_vlm import generate, stream_generate, sample_utils
 import mlx.core as mx
 
 from . import utils, config, local_tools, tts_queue, cache_utils
@@ -317,7 +317,7 @@ def speak_thread(speak_queue):
 @dataclass
 class InferenceOptions:
     model: Any
-    tokenizer: Any
+    processor: Any
     prompt_tokens: list
     cache: Any
     all_tokens:list
@@ -333,13 +333,13 @@ async def setup_inference(
     if model_info is None:
         model_info = utils.loaded_models[config.MAIN_MODEL]
     model = model_info['model']
-    tokenizer = model_info['tokenizer']
+    processor = model_info['processor']
 
     cache, unprocessed_tokens, all_tokens = await get_cache(model_info, message, tools, thinking)
     cache = copy.copy(cache)
     return InferenceOptions(
         model,
-        tokenizer,
+        processor,
         unprocessed_tokens,
         cache,
         all_tokens,
@@ -351,7 +351,7 @@ def submit_inference(
     *, 
     sampler=None,
     max_kv_size=None,
-    max_tokens:int = 256, # Default from mlx_lm
+        max_tokens:int = 256, # Default from mlx-vlm
     loop: asyncio.AbstractEventLoop | None = None    
 ) -> queue.Queue | asyncio.Queue:
     
@@ -365,8 +365,8 @@ def submit_inference(
 
     def thread_worker():
         model = opts.model
-        tokenizer = opts.tokenizer
-        formatted_prompt = opts.prompt_tokens
+        processor = opts.processor
+        formatted_prompt = opts.processor.tokenizer.decode(opts.prompt_tokens)
         cache = opts.cache
         all_tokens=opts.all_tokens
         try:
@@ -375,7 +375,7 @@ def submit_inference(
                 # This runs in a worker thread
                 for response in stream_generate(
                     model,
-                    tokenizer,
+                    processor,
                     prompt=formatted_prompt,
                     sampler=sampler,
                     prompt_cache=cache,
@@ -383,7 +383,6 @@ def submit_inference(
                     max_kv_size=max_kv_size
                 ):
                     put((response.text, response.token, False, None))
-
 
                 cache_utils.dynamic_cache.insert_cache(
                     opts.model_name,
@@ -405,7 +404,7 @@ def submit_inference_job(
     thinking=False,
     sampler=None,
     max_kv_size=None,
-    max_tokens:int=256, # Default from mlx-lm
+    max_tokens:int=256, # Default from mlx-vlm
     loop: asyncio.AbstractEventLoop | None = None
 ) -> queue.Queue | asyncio.Queue:
     opts = asyncio.run(setup_inference(message, tools=tools, thinking=thinking))
@@ -421,7 +420,7 @@ def run_dummy_inference():
     """Run the fastest possible inference, just to keep things alive/in ram"""
     for mod_name, mod_info in utils.loaded_models.items():
         model = mod_info['model']
-        tokenizer= mod_info['tokenizer']
+        processor= mod_info['processor']
         t1 = time.time()
 
         WARMUP_PROMPT = """
@@ -433,7 +432,7 @@ Good morning! Today is a clear day with scheduled tasks. Please review the upcom
             with utils.mlx_inference_lock:
                 generate(
                     model,
-                    tokenizer,
+                    processor,
                     prompt=WARMUP_PROMPT,
                     max_tokens=1,
                     verbose=False,
@@ -453,7 +452,6 @@ Good morning! Today is a clear day with scheduled tasks. Please review the upcom
 def full_refresh_model(mod_name, mod_info):
     """Run a full inference to refresh the model in memory. This is more intensive than the dummy, but can help with performance after an extended idle period."""
     model = mod_info['model']
-    tokenizer = mod_info['tokenizer']
     t1 = time.time()
 
     def thread_worker():
@@ -504,7 +502,7 @@ async def _stream_tokens(
         )
 
         prompt_tokens=opts.prompt_tokens
-        tokenizer = opts.tokenizer
+        tokenizer = opts.processor.tokenizer
         formatted_prompt = tokenizer.decode(prompt_tokens)
 
         if formatted_prompt.strip().endswith("<think>"):

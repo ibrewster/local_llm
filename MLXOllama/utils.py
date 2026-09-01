@@ -278,7 +278,7 @@ OLLAMA_OPTIONS_MAP = {
     "top_p":          "top_p",
     "top_k":          "top_k",
     "repeat_penalty": "repetition_penalty",
-    # "seed":         "seed",  # if mlx_lm supports it
+    # "seed":         "seed",  # if mlx-vlm supports it
 }
 
 def parse_options(raw: dict) -> dict:

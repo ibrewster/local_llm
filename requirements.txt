@@ -6,7 +6,6 @@ pytz
 aiocache
 mlx
 mlx-audio
-mlx-lm
 mlx-vlm
 sounddevice
 soundfile

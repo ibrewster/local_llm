@@ -1,6 +1,5 @@
 import asyncio
 import datetime
-import functools
 import httpx
 import json
 import logging
@@ -9,28 +8,51 @@ import time
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, cast
 
 import xxhash
 
 from mcp.types import TextContent
 import mlx.core as mx
 from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.apc import APCManager, DiskBlockStore
 
 from aiocache import cached
-from mlx_lm.models.cache import (
-    make_prompt_cache,
-    save_prompt_cache,
-    load_prompt_cache,
-    LRUPromptCache
-)
+from mlx_vlm.models import cache as vlm_cache
 
 from . import utils, config
 from .utils import MCP_CLIENT, inference_worker
 
 static_caches = {}
-# dynamic_caches = TTLCache(maxsize=8, ttl=172800)
-dynamic_cache = LRUPromptCache()
+
+
+class VLMCacheLRU:
+    """APC-backed longest-prefix cache using mlx-vlm cache objects."""
+
+    def __init__(self):
+        self._managers = {}
+
+    def _manager(self, model):
+        if model not in self._managers:
+            disk = DiskBlockStore(
+                Path(__file__).parent / "Caches" / "APC",
+                namespace=model,
+                max_bytes=3 * (1 << 30),
+            )
+            self._managers[model] = APCManager(num_blocks=4096, disk=disk)
+        return self._managers[model]
+
+    def fetch_nearest_cache(self, model, tokens):
+        cache, prefix = self._manager(model).lookup_exact_cache(tokens)
+        if cache is None or prefix == 0:
+            return None, tokens
+        return cache, tokens[prefix:]
+
+    def insert_cache(self, model, tokens, cache):
+        self._manager(model).store_exact_cache(tokens, cache)
+
+
+dynamic_cache = VLMCacheLRU()
 state_cache = {}
 itunes_cache = {}
 
@@ -49,29 +71,28 @@ async def get_cache(model_info, messages, tools, thinking=True):
     if is_ha:
         thinking=False
 
-    tokenizer = model_info["tokenizer"]
+    processor = model_info["processor"]
     model = model_info["model"]
     model_name = model_info["name"]
 
-    apply_template = functools.partial(
-        tokenizer.apply_chat_template,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking = thinking
-    )
+    def apply_template(prompt_messages, add_generation_prompt):
+        return apply_chat_template(
+            processor,
+            model.config,
+            prompt_messages,
+            tools=tools,
+            enable_thinking=thinking,
+            add_generation_prompt=add_generation_prompt,
+        )
 
-    base_template = functools.partial(
-        tokenizer.apply_chat_template,
-        tokenize=False,
-        add_generation_prompt=False,
-        enable_thinking = thinking
+    all_tokens = processor.tokenizer.encode(apply_template(messages, True))
+    base_tokens = processor.tokenizer.encode(
+        apply_template(messages, False),
+        add_special_tokens=False,
     )
-
-    all_tokens = tokenizer.encode(apply_template(messages, tools=tools))
-    base_tokens = tokenizer.encode(base_template(messages, tools=tools), add_special_tokens=False)
 
     if len(messages) == 1 or messages[0]['role'] != 'system':
-        return make_prompt_cache(model), all_tokens, base_tokens
+        return vlm_cache.make_prompt_cache(model.language_model), all_tokens, base_tokens
 
     matched = next((v for k, v in STATIC_CACHE_REGISTRY.items() if k in first_prompt), None)
 
@@ -92,7 +113,12 @@ async def get_cache(model_info, messages, tools, thinking=True):
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
 
-        unprocessed_tokens = tokenizer.encode(apply_template(messages[1:]))
+        unprocessed_tokens = processor.tokenizer.encode(
+            apply_template(
+                messages[1:],
+                True,
+            )
+        )
 
     else:
         # Dynamic path — delegate cache locality to LRUPromptCache
@@ -101,7 +127,12 @@ async def get_cache(model_info, messages, tools, thinking=True):
         if cache is None:
             logging.info("Cache Miss (dynamic)")
             cache = await _build_cache(model_info, first_prompt, tools)
-            unprocessed_tokens = tokenizer.encode(apply_template(messages[1:]))
+            unprocessed_tokens = processor.tokenizer.encode(
+                apply_template(
+                    messages[1:],
+                    True,
+                )
+            )
         else:
             logging.info("Cache Hit (dynamic)")
 
@@ -112,6 +143,37 @@ def make_cache_key(model_name: str, messages: list) -> str:
     return xxhash.xxh64(content.encode()).hexdigest()
     
 _cache_io_lock = asyncio.Lock()
+
+
+def save_vlm_prompt_cache(file_name, cache):
+    """Persist an mlx-vlm prompt cache in safetensors format."""
+    from mlx.utils import tree_flatten
+
+    states = [c.state for c in cache]
+    metadata = [c.meta_state for c in cache]
+    arrays = dict(tree_flatten(states))
+    info = dict(tree_flatten([metadata, [type(c).__name__ for c in cache]]))
+    mx.save_safetensors(file_name, arrays, info)
+
+
+def load_vlm_prompt_cache(file_name):
+    """Restore a cache using cache classes from mlx-vlm itself."""
+    from mlx.utils import tree_unflatten
+
+    loaded = cast(
+        tuple[dict[str, mx.array], dict[str, Any]],
+        mx.load(file_name, return_metadata=True),
+    )
+    arrays, raw_metadata = loaded
+    states = tree_unflatten(list(arrays.items()))
+    metadata = tree_unflatten(list(raw_metadata.items()))
+    cache_info, cache_classes = metadata
+    return [
+        getattr(vlm_cache, class_name).from_state(state, meta_state)
+        for class_name, state, meta_state in zip(
+            cache_classes, states, cache_info
+        )
+    ]
 
 async def _save_static_caches():
     async with _cache_io_lock:
@@ -131,7 +193,7 @@ def _save_caches():
         for key, cache in static_caches.items():
             file = path / f"{key}.safetensors"
             with utils.mlx_inference_lock:
-                save_prompt_cache(str(file), cache)
+                save_vlm_prompt_cache(str(file), cache)
     except Exception as e:
         logging.warning(f"Cache save failed (non-critical): {e}")
 
@@ -149,7 +211,7 @@ def _load_caches():
         for f in path.glob("*.safetensors"):
             key = f.stem
             try:
-                static_caches[key] = load_prompt_cache(f)
+                static_caches[key] = load_vlm_prompt_cache(f)
                 logging.info(f"Loaded static cache: {key[:16]}...")  # truncate hash for log readability
             except Exception as e:
                 logging.warning(f"Failed to load cache {key[:16]}...: {e}")
@@ -483,7 +545,7 @@ async def _build_cache(model_info, system_prompt, tools, user_prompt="", images=
         pixel_values = None
 
     def _populate_cache(worker_model, worker_tokens, worker_pixels):
-        worker_cache = make_prompt_cache(model.language_model)
+        worker_cache = vlm_cache.make_prompt_cache(model.language_model)
 
         with utils.mlx_inference_lock:
             logits = worker_model(
