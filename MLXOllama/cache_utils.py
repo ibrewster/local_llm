@@ -24,6 +24,7 @@ from . import utils, config
 from .utils import MCP_CLIENT, inference_worker
 
 static_caches = {}
+static_cache_metadata = {}
 
 
 class VLMCacheLRU:
@@ -63,6 +64,18 @@ _background_tasks = set()
 HA_MARKER = "####HOME ASSISTANT REQUEST####"
 MORNING_MARKER = "#####MORNING#####"
 BEDTIME_MARKER = "###BEDTIME###"
+OPENWEBUI_MARKER = "###OPENWEBUI###"
+
+
+def make_openwebui_cache_signature(first_prompt: str, tools) -> str:
+    """Return a stable identity for the inputs baked into an Open WebUI cache."""
+    cache_inputs = json.dumps(
+        {"first_prompt": first_prompt, "tools": tools or []},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return xxhash.xxh64(cache_inputs.encode()).hexdigest()
 
 async def get_cache(model_info, messages, tools, thinking:bool=True, images:list|None=None):
     first_content = messages[0].get('content', '')
@@ -75,11 +88,18 @@ async def get_cache(model_info, messages, tools, thinking:bool=True, images:list
     if is_ha:
         thinking=False
 
+    is_openwebui = OPENWEBUI_MARKER in first_prompt
+
     processor = model_info["processor"]
     model = model_info["model"]
     model_name = model_info["name"]
 
-    def apply_template(prompt_messages, add_generation_prompt, **template_kwargs):
+    def apply_template(
+        prompt_messages,
+        add_generation_prompt,
+        tools=None,
+        **template_kwargs,
+    ):
         return apply_chat_template(
             processor,
             model.config,
@@ -94,14 +114,26 @@ async def get_cache(model_info, messages, tools, thinking:bool=True, images:list
         # Keep the textual image placeholder intact. stream_generate passes
         # this decoded prompt to the processor, which expands it exactly once
         # using the actual image's soft-token count.
-        return processor.tokenizer.encode(prompt_text)
+        with utils.tokenizer_lock:
+            return processor.tokenizer.encode(prompt_text)
 
-    prompt_text = apply_template(messages, True, num_images=len(images or []))
-    all_tokens = encode_prompt(prompt_text)
-    base_tokens = processor.tokenizer.encode(
-        apply_template(messages, False, num_images=len(images or [])),
-        add_special_tokens=False,
+    prompt_text = apply_template(
+        messages,
+        True,
+        tools=tools,
+        num_images=len(images or []),
     )
+    all_tokens = encode_prompt(prompt_text)
+    with utils.tokenizer_lock:
+        base_tokens = processor.tokenizer.encode(
+            apply_template(
+                messages,
+                False,
+                tools=tools,
+                num_images=len(images or []),
+            ),
+            add_special_tokens=False,
+        )
 
     if len(messages) == 1 or messages[0]['role'] != 'system':
         return vlm_cache.make_prompt_cache(model.language_model), all_tokens, base_tokens
@@ -145,10 +177,26 @@ async def get_cache(model_info, messages, tools, thinking:bool=True, images:list
         cache, unprocessed_tokens = dynamic_cache.fetch_nearest_cache(model_name, all_tokens)
 
         if cache is None:
-            logging.info("Cache Miss (dynamic)")
             # Keep the usual system-prefix KV cache. The image belongs to the
             # user-message suffix and is supplied to stream_generate below.
-            cache = await _build_cache(model_info, first_prompt, tools, thinking=thinking)
+            if is_openwebui and tools:
+                cache_signature = make_openwebui_cache_signature(first_prompt, tools)
+                cache = static_caches.get('OPENWEBUI')
+                if (
+                    cache is None
+                    or static_cache_metadata.get('OPENWEBUI') != cache_signature
+                ):
+                    if cache is not None:
+                        logging.info("OpenWebUI cache invalidated (prompt or tools changed)")
+                    logging.info("Cache Miss (OpenWebUI)")
+                    cache = await create_openwebui_cache(
+                        model_info, first_prompt, tools, cache_signature
+                    )
+                else:
+                    logging.info("Cache Hit (OpenWebUI)")
+            else:
+                logging.info("Cache Miss (dynamic)")
+                cache = await _build_cache(model_info, first_prompt, tools, thinking=thinking)
             unprocessed_tokens = encode_prompt(
                 apply_template(messages[1:], True, num_images=len(images or []))
             )
@@ -213,6 +261,12 @@ def _save_caches():
             file = path / f"{key}.safetensors"
             with utils.mlx_inference_lock:
                 save_vlm_prompt_cache(str(file), cache)
+
+        metadata_file = path / "cache_metadata.json"
+        metadata_file.write_text(
+            json.dumps(static_cache_metadata, sort_keys=True),
+            encoding="utf-8",
+        )
     except Exception as e:
         logging.warning(f"Cache save failed (non-critical): {e}")
 
@@ -227,6 +281,13 @@ async def _load_static_caches():
 def _load_caches():
     path = Path(__file__).parent / "Caches"
     if path.exists():
+        metadata_file = path / "cache_metadata.json"
+        if metadata_file.exists():
+            try:
+                static_cache_metadata.update(json.loads(metadata_file.read_text(encoding="utf-8")))
+            except Exception as e:
+                logging.warning(f"Failed to load cache metadata: {e}")
+
         for f in path.glob("*.safetensors"):
             key = f.stem
             try:
@@ -556,11 +617,13 @@ async def _build_cache(model_info:dict, system_prompt:str, tools:list|None, user
 
     if images is not None:
         # Assumes images is a PIL Image or list of PIL Images
-        inputs = processor(text=[prefix_str], images=images, return_tensors="np")
+        with utils.tokenizer_lock:
+            inputs = processor(text=[prefix_str], images=images, return_tensors="np")
         prefix_tokens = inputs["input_ids"][0]
         pixel_values = mx.array(inputs["pixel_values"])
     else:
-        prefix_tokens = processor.tokenizer.encode(prefix_str)
+        with utils.tokenizer_lock:
+            prefix_tokens = processor.tokenizer.encode(prefix_str)
         pixel_values = None
 
     def _populate_cache(worker_model, worker_tokens, worker_pixels):
@@ -612,6 +675,17 @@ async def create_iTunes_cache():
     all_artists = all_artists[0]['artists']
     itunes_cache['artists'] = {a['name']: a for a in all_artists}
 
+async def create_openwebui_cache(model_info, system_prompt, tools, cache_signature=None):
+    logging.info(f"Creating OpenWebUI cache")
+    t0=time.time()
+    cache = await _build_cache(model_info,system_prompt, tools=tools)
+    static_caches['OPENWEBUI'] = cache
+    static_cache_metadata['OPENWEBUI'] = cache_signature or make_openwebui_cache_signature(
+        system_prompt, tools
+    )
+    await _save_static_caches()
+    logging.info(f"Created OpenWebUI cache in {time.time()-t0:.2f} seconds")
+    return cache
 
 # Registry entry: marker string → (cache_key, factory_fn)
 # factory_fn signature: (model_info, messages, tools) → cache
@@ -619,4 +693,5 @@ STATIC_CACHE_REGISTRY: dict[str, tuple[str, Callable]] = {
     HA_MARKER: ("HA", create_ha_cache),
     MORNING_MARKER: ("MORNING", _morning_cache_factory),
     BEDTIME_MARKER: ("BEDTIME", create_bedtime_cache),
+#    OPENWEBUI_MARKER: ("OPENWEBUI", create_openwebui_cache)
 }

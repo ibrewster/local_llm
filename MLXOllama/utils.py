@@ -27,6 +27,11 @@ from . import config, mcp_client
 
 ##### GLOBAL OBJECTS#######
 cache_lock = Lock()
+# Hugging Face's fast tokenizer is backed by a Rust object whose mutable
+# internals cannot be borrowed by two threads at once.  The processor/tokenizer
+# is shared by the async request handlers and the inference worker, so protect
+# every tokenizer/processor operation that can touch it.
+tokenizer_lock = threading.RLock()
 model_ready = {}
 loaded_models = {}
 

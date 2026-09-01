@@ -17,6 +17,7 @@ import mlx.core as mx
 
 from . import utils, config, local_tools, tts_queue, cache_utils
 from .cache_utils import get_cache
+from .common import message_text
 from .utils import inference_worker
 
 alaskan_content = {
@@ -371,24 +372,28 @@ def submit_inference(
     def thread_worker():
         model = opts.model
         processor = opts.processor
-        formatted_prompt = opts.processor.tokenizer.decode(opts.prompt_tokens)
+        with utils.tokenizer_lock:
+            formatted_prompt = opts.processor.tokenizer.decode(opts.prompt_tokens)
         cache = opts.cache
         all_tokens=opts.all_tokens
         try:
             with utils.mlx_inference_lock:
                 mx.random.seed(int(time.time()))
                 # This runs in a worker thread
-                for response in stream_generate(
-                    model,
-                    processor,
-                    prompt=formatted_prompt,
-                    image=opts.images,
-                    sampler=sampler,
-                    prompt_cache=cache,
-                    max_tokens=max_tokens,
-                    max_kv_size=max_kv_size
-                ):
-                    put((response.text, response.token, False, None))
+                # stream_generate may use the processor/tokenizer internally;
+                # keep it under the same lock as request-side encode/decode.
+                with utils.tokenizer_lock:
+                    for response in stream_generate(
+                        model,
+                        processor,
+                        prompt=formatted_prompt,
+                        image=opts.images,
+                        sampler=sampler,
+                        prompt_cache=cache,
+                        max_tokens=max_tokens,
+                        max_kv_size=max_kv_size
+                    ):
+                        put((response.text, response.token, False, None))
 
                 cache_utils.dynamic_cache.insert_cache(
                     opts.model_name,
@@ -494,7 +499,9 @@ async def _stream_tokens(
     eval_count = 0
     try:
         
-        if "### task:" in msg_history[-1].get("content", "").lower():
+        # OpenAI vision requests represent content as text/image parts rather
+        # than the string used by Ollama requests.
+        if "### task:" in message_text(msg_history[-1].get("content", "")).lower():
             options['temp'] = 0.1
             think = False
             options['max_tokens'] = 256
@@ -524,7 +531,9 @@ async def _stream_tokens(
         if "<|channel>" in formatted_prompt:
             yield "<|channel>" + formatted_prompt.rsplit("<|channel>")[1], False, None
 
-        suffix_tokens = tokenizer.encode(formatted_prompt)
+        with utils.tokenizer_lock:
+            suffix_tokens = tokenizer.encode(formatted_prompt)
+
         logging.info(f"{len(suffix_tokens)} Tokens encoded")
 
         available_space = 262144 - len(suffix_tokens) - 100
@@ -562,8 +571,10 @@ async def _stream_tokens(
             full_output_tokens.append(token)
             yield text, False, None
 
-        state['context'] = tokenizer.encode(formatted_prompt) + full_output_tokens
-        state['eval_count'] = len(tokenizer.encode(formatted_prompt))
+        with utils.tokenizer_lock:
+            prompt_tokens = tokenizer.encode(formatted_prompt)
+        state['context'] = prompt_tokens + full_output_tokens
+        state['eval_count'] = len(prompt_tokens)
     except Exception as e:
         logging.exception(f"Unable to generate output ({e})")
         state['context'] = None
