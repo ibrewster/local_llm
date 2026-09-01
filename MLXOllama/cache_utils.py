@@ -64,7 +64,7 @@ HA_MARKER = "####HOME ASSISTANT REQUEST####"
 MORNING_MARKER = "#####MORNING#####"
 BEDTIME_MARKER = "###BEDTIME###"
 
-async def get_cache(model_info, messages, tools, thinking=True, images=None):
+async def get_cache(model_info, messages, tools, thinking:bool=True, images:list|None=None):
     first_content = messages[0].get('content', '')
     first_prompt = first_content if isinstance(first_content, str) else " ".join(
         item.get("text", "") for item in first_content
