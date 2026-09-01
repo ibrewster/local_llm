@@ -1,4 +1,6 @@
 import asyncio
+import base64
+from io import BytesIO
 import json
 import multiprocessing
 import logging
@@ -6,10 +8,80 @@ import logging
 from pathlib import Path
 
 import quart
+from PIL import Image
 import sounddevice as sd
 import soundfile as sf
 
 from . import app, speak_queue, config, utils, worker, cache_utils
+
+
+async def _read_chat_request():
+    """Read a chat request from JSON or multipart/form-data.
+
+    Multipart requests may put the Ollama/OpenAI JSON payload in ``data`` and
+    one or more image files in fields named ``image`` or ``images``.
+    """
+    if quart.request.is_json:
+        return await quart.request.get_json(), []
+
+    form = await quart.request.form
+    raw_data = form.get("data") or form.get("request") or form.get("json")
+    if not raw_data:
+        raise ValueError("multipart chat requests must include a data field")
+    data = json.loads(raw_data)
+
+    images = []
+    files = await quart.request.files
+    for upload in files.getlist("images") + files.getlist("image"):
+        image_bytes = await upload.read()
+        images.append(Image.open(BytesIO(image_bytes)).convert("RGB"))
+    return data, images
+
+
+def _images_from_messages(messages):
+    """Decode data-URI/base64 images supplied in a JSON message."""
+    images = []
+    for message in messages:
+        # Ollama's native chat format puts base64 image data directly on the
+        # message, while OpenAI-compatible clients use image_url content.
+        message_images = message.get("images", []) if isinstance(message, dict) else []
+        if isinstance(message_images, str):
+            message_images = [message_images]
+        for encoded in message_images:
+            try:
+                if encoded.startswith("data:image/"):
+                    encoded = encoded.split(",", 1)[1]
+                images.append(Image.open(BytesIO(base64.b64decode(encoded))).convert("RGB"))
+            except Exception as exc:
+                raise ValueError(f"invalid image data: {exc}") from exc
+
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            image_url = item.get("image_url", item.get("input_image"))
+            url = image_url.get("url") if isinstance(image_url, dict) else image_url
+            if not isinstance(url, str) or not url.startswith("data:image/"):
+                continue
+            try:
+                _, encoded = url.split(",", 1)
+                images.append(Image.open(BytesIO(base64.b64decode(encoded))).convert("RGB"))
+            except Exception as exc:
+                raise ValueError(f"invalid image data: {exc}") from exc
+    return images
+
+
+def _message_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            item.get("text", "") for item in content
+            if isinstance(item, dict) and item.get("type") in ("text", "input_text")
+        )
+    return ""
 
 
 @app.route("/playGoodnight", methods=["POST"])
@@ -164,17 +236,21 @@ async def api_generate():
     
 @app.route("/api/chat", methods=["POST"])
 async def api_chat():
-    data = await quart.request.get_json()
+    try:
+        data, uploaded_images = await _read_chat_request()
+        messages = data.get("messages", [])
+        images = uploaded_images + _images_from_messages(messages)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        return quart.jsonify({"error": str(exc)}), 400
+
     model_name = data.get("model", config.QUICK_MODEL)
-    messages = data.get("messages", [])
     options = utils.parse_options(data.get("options", {}))
     stream = data.get("stream", True)
     tools = data.get("tools") or None
     think = data.get("think", False)
-    
     model_info = utils.loaded_models[model_name]
     
-    last_message = messages[-1]['content'].strip() if messages[-1].get('role') == 'user' else ''
+    last_message = _message_text(messages[-1].get('content', '')).strip() if messages and messages[-1].get('role') == 'user' else ''
 
     if last_message == 'refresh cache':
         asyncio.create_task(cache_utils.refresh_cache_background())
@@ -232,7 +308,8 @@ async def api_chat():
                 messages,
                 options,
                 tools=tools,
-                think=think
+                think=think,
+                images=images,
             ), 
             mimetype="application/x-ndjson",
         )
@@ -246,7 +323,8 @@ async def api_chat():
             messages,
             options,
             tools=tools,
-            think=think
+            think=think,
+            images=images,
         ):
             final_chunk = json.loads(chunk_json)
         

@@ -322,20 +322,24 @@ class InferenceOptions:
     cache: Any
     all_tokens:list
     model_name: str
+    images: list | None = None
 
 async def setup_inference(
     message: list,
     *,
     tools: list | None = None,
     thinking: bool = False,
-    model_info: dict | None = None
+    model_info: dict | None = None,
+    images: list | None = None
 ) -> InferenceOptions:
     if model_info is None:
         model_info = utils.loaded_models[config.MAIN_MODEL]
     model = model_info['model']
     processor = model_info['processor']
 
-    cache, unprocessed_tokens, all_tokens = await get_cache(model_info, message, tools, thinking)
+    cache, unprocessed_tokens, all_tokens = await get_cache(
+        model_info, message, tools, thinking, images=images
+    )
     cache = copy.copy(cache)
     return InferenceOptions(
         model,
@@ -343,7 +347,8 @@ async def setup_inference(
         unprocessed_tokens,
         cache,
         all_tokens,
-        model_info['name']
+        model_info['name'],
+        images,
     )
     
 def submit_inference(
@@ -377,6 +382,7 @@ def submit_inference(
                     model,
                     processor,
                     prompt=formatted_prompt,
+                    image=opts.images,
                     sampler=sampler,
                     prompt_cache=cache,
                     max_tokens=max_tokens,
@@ -392,6 +398,11 @@ def submit_inference(
             put(("", None, True, None))
 
         except Exception as e:
+            logging.exception(
+                "mlx-vlm stream_generate failed (image_count=%d, prompt_chars=%d)",
+                len(opts.images or []),
+                len(formatted_prompt),
+            )
             put((None, None, True, e))
 
     inference_worker.submit(thread_worker)
@@ -468,7 +479,8 @@ async def _stream_tokens(
     model_info: dict, msg_history: list[dict],
     options: dict, state: dict|None=None,
     tools: list|None = None,
-    think: bool = False
+    think: bool = False,
+    images: list | None = None
 ):
     """
     Yields (token_str, is_done, stats) tuples.
@@ -491,7 +503,8 @@ async def _stream_tokens(
             msg_history,
             tools=tools,
             thinking=think,
-            model_info=model_info
+            model_info=model_info,
+            images=images,
         )
 
         sampler = sample_utils.make_sampler(
@@ -536,8 +549,11 @@ async def _stream_tokens(
 
             if isinstance(err, Exception):
                 # Optional: yield partial + log, then re-raise or swallow
-                logging.error(f"Inference error: {err}")
-                yield "", True, {"error": str(err)}
+                logging.error("Inference error: %s (%r)", str(err), err)
+                logging.error("Inference traceback:\n%s", "".join(
+                    traceback.format_exception(type(err), err, err.__traceback__)
+                ))
+                yield "", True, {"error": str(err) or repr(err)}
                 break
             if is_done:
                 break
@@ -557,7 +573,7 @@ async def _stream_tokens(
     yield "", True, {"eval_count": eval_count, "eval_duration": elapsed}
 
 async def generate_stream(stream, model_info, msg_history, options,
-                          is_gen=False, tools=None, think=False):
+                          is_gen=False, tools=None, think=False, images=None):
     t1 = time.time_ns()
 
     for msg in msg_history:
@@ -593,7 +609,8 @@ async def generate_stream(stream, model_info, msg_history, options,
 
         try:
             async for token, done, stats in _stream_tokens(
-                model_info, msg_history, options, state, tools=tools, think=think
+                model_info, msg_history, options, state, tools=tools, think=think,
+                images=images
             ):
                 if unicode_buf or '\\' in token:
                     unicode_buf += token

@@ -64,8 +64,12 @@ HA_MARKER = "####HOME ASSISTANT REQUEST####"
 MORNING_MARKER = "#####MORNING#####"
 BEDTIME_MARKER = "###BEDTIME###"
 
-async def get_cache(model_info, messages, tools, thinking=True):
-    first_prompt = messages[0]['content']
+async def get_cache(model_info, messages, tools, thinking=True, images=None):
+    first_content = messages[0].get('content', '')
+    first_prompt = first_content if isinstance(first_content, str) else " ".join(
+        item.get("text", "") for item in first_content
+        if isinstance(item, dict) and item.get("type") in ("text", "input_text")
+    )
 
     is_ha = HA_MARKER in first_prompt
     if is_ha:
@@ -75,7 +79,7 @@ async def get_cache(model_info, messages, tools, thinking=True):
     model = model_info["model"]
     model_name = model_info["name"]
 
-    def apply_template(prompt_messages, add_generation_prompt):
+    def apply_template(prompt_messages, add_generation_prompt, **template_kwargs):
         return apply_chat_template(
             processor,
             model.config,
@@ -83,11 +87,19 @@ async def get_cache(model_info, messages, tools, thinking=True):
             tools=tools,
             enable_thinking=thinking,
             add_generation_prompt=add_generation_prompt,
+            **template_kwargs,
         )
 
-    all_tokens = processor.tokenizer.encode(apply_template(messages, True))
+    def encode_prompt(prompt_text):
+        # Keep the textual image placeholder intact. stream_generate passes
+        # this decoded prompt to the processor, which expands it exactly once
+        # using the actual image's soft-token count.
+        return processor.tokenizer.encode(prompt_text)
+
+    prompt_text = apply_template(messages, True, num_images=len(images or []))
+    all_tokens = encode_prompt(prompt_text)
     base_tokens = processor.tokenizer.encode(
-        apply_template(messages, False),
+        apply_template(messages, False, num_images=len(images or [])),
         add_special_tokens=False,
     )
 
@@ -113,25 +125,32 @@ async def get_cache(model_info, messages, tools, thinking=True):
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
 
-        unprocessed_tokens = processor.tokenizer.encode(
-            apply_template(
-                messages[1:],
-                True,
-            )
+        unprocessed_tokens = encode_prompt(
+            apply_template(messages[1:], True, num_images=len(images or []))
         )
 
     else:
         # Dynamic path — delegate cache locality to LRUPromptCache
+        if images:
+            # The generic token-only APC lookup cannot distinguish two images
+            # with identical surrounding text. Reuse the system-prefix cache,
+            # while letting the processor handle the image-bearing suffix.
+            logging.info("Image request: using system-prefix KV cache")
+            cache = await _build_cache(model_info, first_prompt, tools, thinking=thinking)
+            unprocessed_tokens = encode_prompt(
+                apply_template(messages[1:], True, num_images=len(images))
+            )
+            return cache, unprocessed_tokens, base_tokens
+
         cache, unprocessed_tokens = dynamic_cache.fetch_nearest_cache(model_name, all_tokens)
 
         if cache is None:
             logging.info("Cache Miss (dynamic)")
+            # Keep the usual system-prefix KV cache. The image belongs to the
+            # user-message suffix and is supplied to stream_generate below.
             cache = await _build_cache(model_info, first_prompt, tools, thinking=thinking)
-            unprocessed_tokens = processor.tokenizer.encode(
-                apply_template(
-                    messages[1:],
-                    True,
-                )
+            unprocessed_tokens = encode_prompt(
+                apply_template(messages[1:], True, num_images=len(images or []))
             )
         else:
             logging.info("Cache Hit (dynamic)")
