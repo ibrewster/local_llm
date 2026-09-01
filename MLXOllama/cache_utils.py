@@ -37,7 +37,7 @@ class VLMCacheLRU:
             disk = DiskBlockStore(
                 Path(__file__).parent / "Caches" / "APC",
                 namespace=model,
-                max_bytes=3 * (1 << 30),
+                max_bytes=12 * (1 << 30),
             )
             self._managers[model] = APCManager(num_blocks=4096, disk=disk)
         return self._managers[model]
