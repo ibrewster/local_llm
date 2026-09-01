@@ -384,6 +384,7 @@ def submit_inference(
                 ):
                     put((response.text, response.token, False, None))
 
+
                 cache_utils.dynamic_cache.insert_cache(
                     opts.model_name,
                     all_tokens,

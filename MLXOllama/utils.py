@@ -20,7 +20,7 @@ import mlx.core as mx
 
 from cachetools import TTLCache
 from huggingface_hub import snapshot_download
-from mlx_lm import sample_utils, load
+from mlx_vlm import sample_utils, load
 
 from . import config, mcp_client
 

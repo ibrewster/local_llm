@@ -7,6 +7,7 @@ aiocache
 google-genai
 mlx-audio
 mlx-lm
+mlx-vlm
 sounddevice
 soundfile
 numpy
