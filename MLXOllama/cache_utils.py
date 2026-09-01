@@ -15,6 +15,7 @@ from typing import Callable
 import xxhash
 
 import mlx.core as mx
+from mlx_vlm.prompt_utils import apply_chat_template
 
 from aiocache import cached
 from cachetools import TTLCache
@@ -443,35 +444,56 @@ async def create_ha_cache(*args, **kwargs):
     return cache
 
 
-async def _build_cache(model_info, system_prompt, tools, user_prompt=""):
+async def _build_cache(model_info, system_prompt, tools, user_prompt="", images=None):
     model = model_info['model']
-    tokenizer = model_info['tokenizer']
+    processor = model_info['processor']  # Use processor instead of tokenizer
+
+    # 1. Structure the messages. If using images, the format includes dicts.
+    user_content = []
+    if images is not None:
+        user_content.append({"type": "image"})
+    if user_prompt:
+        user_content.append({"type": "text", "text": user_prompt})
 
     prefix_messages = [
-        {'role': 'system', 'content': system_prompt},  # system
-        {"role": "user", "content": user_prompt}
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content}
     ]
 
-    prefix_str = tokenizer.apply_chat_template(
+    prefix_str = apply_chat_template(
+        processor,
+        model.config,
         prefix_messages,
         tools=tools,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False
+        enable_thinking=False,
+        add_generation_prompt=True
     )
 
-    prefix_tokens = tokenizer.encode(prefix_str)
+    if images is not None:
+        # Assumes images is a PIL Image or list of PIL Images
+        inputs = processor(text=[prefix_str], images=images, return_tensors="np")
+        prefix_tokens = inputs["input_ids"][0]
+        pixel_values = mx.array(inputs["pixel_values"])
+    else:
+        prefix_tokens = processor.tokenizer.encode(prefix_str)
+        pixel_values = None
 
-    def _populate_cache(model, prefix_tokens):
-        cache = make_prompt_cache(model)
+    def _populate_cache(worker_model, worker_tokens, worker_pixels):
+        worker_cache = make_prompt_cache(model.language_model)
+
         with utils.mlx_inference_lock:
-            logits = model(mx.array([prefix_tokens]), cache=cache)
+            # 5. Use kwargs for the forward pass
+            logits = worker_model(
+                input_ids=mx.array([worker_tokens]),
+                pixel_values=worker_pixels,
+                cache=worker_cache
+            )
             mx.eval(logits)
-        return cache
+        return worker_cache
 
-    future = inference_worker.submit(_populate_cache, model, prefix_tokens)
+    future = inference_worker.submit(_populate_cache, model, prefix_tokens, pixel_values)
     cache = await asyncio.wrap_future(future)
-#    cache = await asyncio.to_thread(_populate_cache, model, prefix_tokens)
+
     logging.info(f"Prefix tokens: {len(prefix_tokens)}")
 
     return cache
