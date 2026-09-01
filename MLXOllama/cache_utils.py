@@ -1,7 +1,6 @@
 import asyncio
 import datetime
 import functools
-import gc
 import httpx
 import json
 import logging
@@ -14,11 +13,11 @@ from typing import Callable
 
 import xxhash
 
+from mcp.types import TextContent
 import mlx.core as mx
 from mlx_vlm.prompt_utils import apply_chat_template
 
 from aiocache import cached
-from cachetools import TTLCache
 from mlx_lm.models.cache import (
     make_prompt_cache,
     save_prompt_cache,
@@ -180,7 +179,7 @@ async def get_rest_data() -> list[dict]:
             response.raise_for_status()
     except Exception as e:
         print(e)
-        return
+        return []
 
     return response.json()
 
@@ -200,7 +199,7 @@ async def refresh_entity_states():
     entity_data = await get_rest_data()
     if entity_data is None:
         logging.warning("Unable to update entity data. No new data recieved.")
-        return;
+        return
 
     for entity in entity_data:
         entity_id = entity['entity_id']
@@ -227,7 +226,7 @@ async def refresh_entity_states():
 
 
 @cached(ttl=21600)  # six hours
-async def get_entity_ids() -> dict[str:str]:
+async def get_entity_ids() -> dict[str,str]:
     # Get more information on the entities from the REST api
     response = await get_rest_data()
 
@@ -240,9 +239,13 @@ async def get_entity_ids() -> dict[str:str]:
 
 @cached(ttl=86400)  # 24 hours
 async def get_live_context() -> list[LiveEntity]:
-    ha_exposed_entities = await MCP_CLIENT.call_tool('homeassistant_GetLiveContext')
+    result = await MCP_CLIENT.call_tool('homeassistant_GetLiveContext')
 
-    exposed_entities: str = json.loads(ha_exposed_entities.content[0].text)['result']
+    if not result.content or not isinstance(result.content[0], TextContent):
+        raise ValueError("Expected a text response from Home Assistant")
+
+    payload = json.loads(result.content[0].text)
+    exposed_entities: str = payload["result"]
     exposed_entities = re.sub(r"^Live Context:.*?\n", "", exposed_entities, flags=re.DOTALL).strip()
 
     entities: list[LiveEntity] = []
@@ -301,7 +304,8 @@ async def cache_refresh_loop():
         static_caches['HA'] = ha_cache
         await _save_static_caches()
     else:
-        speak_queue.put_nowait("UPDATE")
+        if speak_queue is not None:
+            speak_queue.put_nowait("UPDATE")
 
     TARGET_TIME = datetime.time(0, 30)  # 12:30 AM
     while True:
@@ -350,7 +354,7 @@ async def get_tools():
     return mcp_tools
 
 
-async def _morning_cache_factory(*args, **kwargs):
+async def _morning_cache_factory(*_args, **_kwargs):
     return await create_morning_cache("")
 
 
@@ -366,7 +370,7 @@ async def create_morning_cache(news_prompt=""):
     return cache
 
 
-async def create_bedtime_cache(*args, **kwargs):
+async def create_bedtime_cache(*_args, **_kwargs):
     logging.info(f"Creating bedtime cache")
     t0 = time.time()
     system_prompt = (Path(__file__).parent / "Prompts" / "bedtime_system.txt").read_text()
@@ -378,7 +382,7 @@ async def create_bedtime_cache(*args, **kwargs):
     return cache
 
 
-async def create_ha_cache(*args, **kwargs):
+async def create_ha_cache(*_args, **_kwargs):
     from . import speak_queue
     from .local_tools import LOCAL_TOOLS
 
@@ -439,7 +443,8 @@ async def create_ha_cache(*args, **kwargs):
     cache = await _build_cache(model_info, system_prompt, tools)
 
     logging.info(f"Created and populated HA cache in {time.time() - t0}s")
-    speak_queue.put_nowait("UPDATE")
+    if speak_queue is not None:
+        speak_queue.put_nowait("UPDATE")
 
     return cache
 
@@ -448,7 +453,6 @@ async def _build_cache(model_info, system_prompt, tools, user_prompt="", images=
     model = model_info['model']
     processor = model_info['processor']  # Use processor instead of tokenizer
 
-    # 1. Structure the messages. If using images, the format includes dicts.
     user_content = []
     if images is not None:
         user_content.append({"type": "image"})
@@ -482,7 +486,6 @@ async def _build_cache(model_info, system_prompt, tools, user_prompt="", images=
         worker_cache = make_prompt_cache(model.language_model)
 
         with utils.mlx_inference_lock:
-            # 5. Use kwargs for the forward pass
             logits = worker_model(
                 input_ids=mx.array([worker_tokens]),
                 pixel_values=worker_pixels,

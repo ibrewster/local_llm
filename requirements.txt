@@ -4,7 +4,7 @@ cachetools
 setproctitle
 pytz
 aiocache
-google-genai
+mlx
 mlx-audio
 mlx-lm
 mlx-vlm
@@ -19,3 +19,6 @@ num2words
 spacy
 phonemizer
 rapidfuzz
+mcp
+
+httpx
