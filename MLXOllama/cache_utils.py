@@ -126,7 +126,7 @@ async def get_cache(model_info, messages, tools, thinking=True):
 
         if cache is None:
             logging.info("Cache Miss (dynamic)")
-            cache = await _build_cache(model_info, first_prompt, tools)
+            cache = await _build_cache(model_info, first_prompt, tools, thinking=thinking)
             unprocessed_tokens = processor.tokenizer.encode(
                 apply_template(
                     messages[1:],
@@ -511,7 +511,7 @@ async def create_ha_cache(*_args, **_kwargs):
     return cache
 
 
-async def _build_cache(model_info, system_prompt, tools, user_prompt="", images=None):
+async def _build_cache(model_info:dict, system_prompt:str, tools:list|None, user_prompt:str="", images:list|None=None, thinking:bool=False):
     model = model_info['model']
     processor = model_info['processor']  # Use processor instead of tokenizer
 
@@ -531,7 +531,7 @@ async def _build_cache(model_info, system_prompt, tools, user_prompt="", images=
         model.config,
         prefix_messages,
         tools=tools,
-        enable_thinking=False,
+        enable_thinking=thinking,
         add_generation_prompt=True
     )
 
