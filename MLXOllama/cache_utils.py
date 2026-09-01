@@ -36,9 +36,9 @@ class VLMCacheLRU:
     def _manager(self, model):
         if model not in self._managers:
             disk = DiskBlockStore(
-                Path(__file__).parent / "Caches" / "APC",
+                Path(config.CACHE_PATH) / "APC",
                 namespace=model,
-                max_bytes=12 * (1 << 30),
+                max_bytes=200 * (1 << 30),
             )
             self._managers[model] = APCManager(num_blocks=4096, disk=disk)
         return self._managers[model]
@@ -249,8 +249,8 @@ async def _save_static_caches():
 
 
 def _save_caches():
-    path: Path = Path(__file__).parent / "Caches"
-    path.mkdir(exist_ok=True)
+    path: Path = Path(config.CACHE_PATH)
+    path.mkdir(parents=True, exist_ok=True)
 
     # Clean up any existing Caches
     for f in path.glob('*.safetensors'):
@@ -279,7 +279,7 @@ async def _load_static_caches():
 
 
 def _load_caches():
-    path = Path(__file__).parent / "Caches"
+    path = Path(config.CACHE_PATH)
     if path.exists():
         metadata_file = path / "cache_metadata.json"
         if metadata_file.exists():

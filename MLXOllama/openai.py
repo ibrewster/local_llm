@@ -8,7 +8,7 @@ import quart
 from . import app, config, utils, worker
 from .common import images_from_messages, read_chat_request
 
-
+assert app is not None # because the app wouldn't be running if it was
 JsonObject = dict[str, Any]
 
 

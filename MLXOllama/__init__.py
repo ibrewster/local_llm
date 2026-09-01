@@ -18,10 +18,14 @@ utils.init_logging()
 from quart import Quart
 from quart.logging import default_handler
 
-app = None
-speak_queue = None
-process_thread = None
-tts_queue: multiprocessing.Queue = None
+# Go ahead and ignore bad-assignment errors here, because if
+# these are not initialized at application start, the program has already died.
+# This keeps the type checker happy.
+app:Quart = None # pyrefly: ignore[bad-assignment]
+tts_queue: multiprocessing.Queue = None # pyrefly: ignore[bad-assignment]
+speak_queue:queue.Queue = None # pyrefly: ignore[bad-assignment]
+process_thread:threading.Thread = None # pyrefly: ignore[bad-assignment]
+
 
 def setup_app():    
     global app, speak_queue, process_thread

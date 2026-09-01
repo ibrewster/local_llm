@@ -22,3 +22,6 @@ rapidfuzz
 mcp
 
 httpx
+
+hypercorn
+huggingface-hub

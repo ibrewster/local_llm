@@ -16,7 +16,7 @@ from MLXOllama import tts_streamer
 
 from whisper import run_whisper_process
 
-def _sigterm_handler(signum, frame):
+def _sigterm_handler(_signum, _frame):
     os.kill(os.getpid(), signal.SIGINT)
     
 signal.signal(signal.SIGTERM, _sigterm_handler)
@@ -42,7 +42,7 @@ if __name__ == "__main__":
     hconfig.accesslog = logging.getLogger()   # pass root logger directly
     hconfig.errorlog = logging.getLogger()
     
-    MLXOllama.setup_app()
+    MLXOllama.setup_app() # Sets up speak_queue and process_thread
 
     if MLXOllama.app is None:
         raise RuntimeError("APP initilization failed. MLXOllama.app is None")

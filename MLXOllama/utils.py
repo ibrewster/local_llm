@@ -175,15 +175,15 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 def get_model_path(repo_id: str) -> Path:
-    """Returns the local snapshot path for a HF repo, downloading if needed.
+    """Returns the local snapshot path for a huggingface repo, downloading if needed.
     If already cached, this is instantaneous — no network call."""
     return Path(snapshot_download(repo_id=repo_id, local_files_only=True))
 
 def model_digest(model_id: str) -> str:
     """SHA-256 of the model's config.json — stable across process restarts,
     changes if the model is actually updated."""
-    config = get_model_path(model_id) / "config.json"
-    return "sha256:" + hashlib.sha256(config.read_bytes()).hexdigest()
+    _config = get_model_path(model_id) / "config.json"
+    return "sha256:" + hashlib.sha256(_config.read_bytes()).hexdigest()
 
 def model_details(model_name: str) -> dict:
     """Build details from the actual loaded model config."""
@@ -201,37 +201,44 @@ def model_details(model_name: str) -> dict:
         "quantization_level": _quant_from_repo_id(repo_id)
     }
 
-def _param_size(name: str, config: dict):
+def _param_size(name: str, model_config: dict):
     if s := _param_size_from_name(name):
         return s
 
-    if n := config.get("num_parameters"):
+    if n := model_config.get("num_parameters"):
         return f"{n/1e9:.1f}B"
 
-    return _estimate_from_config(config)
+    return _estimate_from_config(model_config)
 
 
 def _param_size_from_name(name: str):
     m = re.search(r'(\d+(?:\.\d+)?)B', name, re.IGNORECASE)
     if m:
         return f"{m.group(1)}B"
+    return None
 
-def _estimate_from_config(config: dict) -> str:
+
+def _estimate_from_config(model_config: dict) -> str:
     """Estimate parameter count from hidden_size/num_layers if not explicit."""
     # Qwen config.json has num_parameters directly in some versions,
     # otherwise derive it or just read it from the directory name / model card
-    if n := config.get("num_parameters"):
+    if n := model_config.get("num_parameters"):
         return f"{n/1e9:.1f}B"
 
-    h = config.get("hidden_size")
-    i = config.get("intermediate_size")
-    L = config.get("num_hidden_layers")
-    v = config.get("vocab_size")
+    h = model_config.get("hidden_size")
+    i = model_config.get("intermediate_size")
+    L = model_config.get("num_hidden_layers")
+    v = model_config.get("vocab_size")
 
-    if all((h, i, L, v)):
+    if (
+        isinstance(h, (int, float)) and h
+        and isinstance(i, (int, float)) and i
+        and isinstance(L, (int, float)) and L
+        and isinstance(v, (int, float)) and v
+    ):
         per_layer = 4 * h * h + 2 * h * i
         total = L * per_layer + v * h
-        billions = int(round(total / 1e9))
+        billions = round(total / 1e9)
         return f"{billions}B"
 
     return "7B"  # fallback
@@ -277,7 +284,7 @@ def family_name(model_name: str, model_type: str):
     return model_type
 
 OLLAMA_OPTIONS_MAP = {
-    # Ollama option  -> you can map to mlx param names
+    # Ollama option -> you can map to mlx param names
     "temperature":    "temp",
     "num_predict":    "max_tokens",
     "top_p":          "top_p",
@@ -320,7 +327,7 @@ def parse_tool_calls(text: str) -> tuple[Optional[List[Dict]], str]:
         for m in re.finditer(param_pattern, block, re.DOTALL | re.IGNORECASE):
             key = m.group(1).strip()
             val_str = m.group(2).strip()
-            # smart type coercion (same as before)
+
             try:
                 if val_str.startswith('[') and val_str.endswith(']'):
                     val = json.loads(val_str)
@@ -330,7 +337,7 @@ def parse_tool_calls(text: str) -> tuple[Optional[List[Dict]], str]:
                     val = float(val_str) if '.' in val_str else int(val_str)
                 else:
                     val = val_str
-            except:
+            except (json.JSONDecodeError, ValueError) as _e:
                 val = val_str
             params[key] = val
 
@@ -412,7 +419,11 @@ def load_model(name, path):
     model, processor = load(path)
     model_config = load_config(path)
 
-    model_bytes = sum(x.nbytes for _, x in mx_utils.tree_flatten(model.parameters()))
+    model_bytes = sum(
+        x.nbytes
+        for _, x in mx_utils.tree_flatten(model.parameters())
+        if isinstance(x, mx.array)
+    )
     
     loaded_models[name] = {
         "model": model,
