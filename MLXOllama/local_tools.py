@@ -1,7 +1,22 @@
 import json
+import inspect
+import re
+import types
 
-from datetime import datetime, timedelta
-from typing import Any
+from datetime import datetime, timedelta, date
+from enum import Enum
+from typing import (
+    Any,
+    Annotated,
+    Literal,
+    Mapping,
+    Sequence,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
+from uuid import UUID
 from urllib.parse import quote
 
 import httpx
@@ -11,237 +26,352 @@ from rapidfuzz import process, fuzz, utils
 
 from . import cache_utils
 
-LOCAL_TOOLS = {
-    "pause_music": {
-        "type": "function",
-        "function": {
-            "name": "pause_music",
-            "description": "Pauses the music. You MUST call this every time a user asks to pause or stop the music",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
-    },
-    "list_playlists": {
-        "type": "function",
-        "function": {
-            "name": "list_playlists",
-            "description": "Retrieves all playlists from the library. Call this tool first to find the 'id' of a playlist when the user refers to one by name, or to answer questions about available playlists. Returns a list of playlist objects with 'id' and 'name' properties.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
-    },
-    "get_current_playback": {
-        "type": "function",
-        "function": {
-            "name": "get_current_playback",
-            "description": "Retrieves the current playback state from Apple Music, including whether something is playing/paused/stopped, the current track details (title, artist, album), playback position, and duration. Use this when the user asks 'what's playing', 'what song is this', or needs context before controlling playback.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
-    },
-    # "list_albums": {
-        # "type": "function",
-        # "function": {
-            # "name": "list_albums",
-            # "description": "Retrieves all albums from the library. Call this tool first to find the exact title and artist for a requested album, or to provide information about an album",
-            # "parameters": {
-                # "type": "object",
-                # "properties": {
-                    # 'offset': {
-                        # 'type': "integer",'description': "The offset to use when listing albums",
-                    # },
-                    # 'limit': {
-                        # 'type': 'integer','description': "The number of albums to return in the result set",
-                    # },
-                # },
-                # "required": []
-            # }
-        # }
-    # },
-    "search_music": {
-        "type": "function",
-        "function": {
-            "name": "search_music",
-            "description": "Searches the library for albums, artists, or specific tracks. Use this as the primary tool for finding music when the exact title is unknown or to verify metadata. Searches by a single criteria (track, album, artist) ONLY. IMPORTANT: Do not proivde multiple criteria when searching. If user provides both track and either artist and/or album, search by track NAME ONLY.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search term (e.g., 'Dark Side', 'Pink Floyd', or 'Wish You Were Here')."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "default": 10,
-                        "description": "Max results to return."
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    "play_track": {
-        "type": "function",
-        "function": {
-            "name": "play_track",
-            "description": "Plays a single track by its persistent ID. If the ID is unknown, call search_tracks first.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "track_id": {"type": "string", "description": "The persistent ID of the track."}
-                },
-                "required": ["track_id"]
-            }
-        }
-    },
-    "play_playlist": {
-        "type": "function",
-        "function": {
-            "name": "play_playlist",
-            "description": "Plays a playlist by ID. Use list_playlists first to resolve a name to an ID. Support optional shuffling.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "playlist_id": {"type": "string", "description": "The unique ID of the playlist."},
-                    "shuffle": {"type": "boolean", "default": False, "description": "Whether to shuffle the playlist."}
-                },
-                "required": ["playlist_id"]
-            }
-        }
-    },
-    "play_album": {
-        "type": "function",
-        "function": {
-            "name": "play_album",
-            "description": "Plays a specific album. Requires exact artist and album names, as returned by search_music. Use search_music first to get the exact names",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "artist_name": {"type": "string", "description": "The name of the artist."},
-                    "album_name": {"type": "string", "description": "The title of the album."},
-                    "shuffle": {"type": "boolean", "default": False}
-                },
-                "required": ["artist_name", "album_name"]
-            }
-        }
-    },
-    "play_artist": {
-        "type": "function",
-        "function": {
-            "name": "play_artist",
-            "description": "Plays all tracks by a specific artist. Defaults to shuffle mode.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "artist_name": {"type": "string", "description": "The name of the artist."},
-                    "shuffle": {"type": "boolean", "default": True}
-                },
-                "required": ["artist_name"]
-            }
-        }
-    },
-    "get_current_time": {
-        "type": "function",
-        "function": {
-            "name": "get_current_time",
-            "description": "Get the current date and time in the user's timezone. Always use this when the query involves now, today, tomorrow, current time, scheduling, deadlines, recency, etc.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "timezone": {
-                        "type": "string",
-                        "description": "Optional IANA timezone name e.g. 'America/Anchorage'. Defaults to user's known timezone."
-                    }
-                },
-                "required": []
-            }
-        }
-    },
-    "local_entity_state": {
-        "type": "function",
-        "function": {
-            "name": "local_entity_state",
-            "description": "Retrieve the current state and key attributes of one or more entities. Use this tool whenever a question involves the current status, value, location, health, on/off state, brightness, temperature, position, or any real-time property of an entity. Prefer fetching multiple relevant entities in a single call. NOTE: This tool name DOES NOT have a prefix. Call it exactly as 'local_entity_state'",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "entity_ids": {
-                        "type": "array",
-                        "items": {"type": "String"},
-                        "description": "List of entity IDs to fetch (e.g. ['light.kitchen_ceiling', 'sensor.backyard_temperature']). Use a list even for one entity."
-                    }
-                },
-                "required": ['entity_ids'],
-            }
-        }
-    },
-    "get_current_weather": {
-        "type": "function",
-        "function": {
-            "name": "get_current_weather",
-            "description": "Retrieves real-time weather forecasts from the NWS for a specific sector. Use for current, daily, or weekend forecasts.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "latitude": { "type": "number", "description": "Decimal latitude (e.g., 64.837)." },
-                    "longitude": { "type": "number", "description": "Decimal longitude (e.g., -147.716)." },
-                    "location": { "type": "string", "description": "City/State name for non-local scans." },
-                    "timeframe": {
-                        "type": "string",
-                        "enum": ["today", "tomorrow", "this weekend", "7 day"],
-                        "description": "The temporal window for the sensor sweep. Defaults to 'today'."
-                    }
-                },
-                "required": ["location"]
-            }
-        }
-    }
-}
+LOCAL_TOOLS = {}
 
+def _json_schema(annotation: Any) -> dict[str, Any]:
+    """Generate a JSON Schema dict from a Python type annotation.
+
+    Supported:
+      - str, int, float, bool, None
+      - Optional[T] / T | None
+      - Union[T1, T2, ...]
+      - Literal[...]
+      - list[T], set[T], tuple[T], tuple[T, ...]
+      - dict[K, V], Mapping[K, V]
+      - Sequence[T]
+      - Annotated[T, ...]
+      - Enum subclasses
+      - NewType
+      - Any
+      - date, datetime, UUID
+
+    The generated schemas intentionally use a conservative subset of JSON
+    Schema suitable for LLM function-calling backends.
+    """
+    if annotation is inspect.Parameter.empty or annotation is Any:
+        return {}
+
+    # Resolve typing.NewType(...)
+    # NewType objects expose their underlying type as __supertype__.
+    if hasattr(annotation, "__supertype__"):
+        return _json_schema(annotation.__supertype__)
+
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+
+    # Annotated[T, ...] -> schema for T.
+    if origin is Annotated:
+        return _json_schema(args[0])
+
+    # Literal[...]
+    if origin is Literal:
+        literal_values = list(args)
+        schema: dict[str, Any] = {"enum": literal_values}
+
+        # Only add "type" when every literal has the same exact Python type.
+        if literal_values:
+            first_type = type(literal_values[0])
+            if all(type(value) is first_type for value in literal_values):
+                if first_type is str:
+                    schema["type"] = "string"
+                elif first_type is bool:
+                    schema["type"] = "boolean"
+                elif first_type is int:
+                    schema["type"] = "integer"
+                elif first_type is float:
+                    schema["type"] = "number"
+                elif first_type is type(None):
+                    schema["type"] = "null"
+
+        return schema
+
+    # Optional[T], T | None, or a general Union.
+    if origin in (Union, types.UnionType):
+        non_none = [arg for arg in args if arg is not type(None)]
+        has_none = len(non_none) != len(args)
+
+        # Optional[T] / T | None.
+        #
+        # Preserve nullability explicitly when None is actually part of the
+        # allowed value set. This is different from requiredness, which is
+        # determined separately from the function parameter's default value.
+        if len(non_none) == 1:
+            base_schema = _json_schema(non_none[0])
+
+            if has_none:
+                # JSON Schema can express this cleanly with anyOf.
+                #
+                # Example:
+                #   str | None ->
+                #   {"anyOf": [{"type": "string"}, {"type": "null"}]}
+                return {
+                    "anyOf": [
+                        base_schema,
+                        {"type": "null"},
+                    ]
+                }
+
+            return base_schema
+
+        # General Union.
+        union_schema = {
+            "anyOf": [_json_schema(arg) for arg in non_none]
+        }
+
+        if has_none:
+            union_schema["anyOf"].append({"type": "null"})
+
+        return union_schema
+
+    # Enum classes.
+    if inspect.isclass(annotation) and issubclass(annotation, Enum):
+        values = [member.value for member in annotation]
+
+        schema = {"enum": values}
+
+        if values:
+            first_type = type(values[0])
+            if all(type(value) is first_type for value in values):
+                if first_type is str:
+                    schema["type"] = "string"
+                elif first_type is bool:
+                    schema["type"] = "boolean"
+                elif first_type is int:
+                    schema["type"] = "integer"
+                elif first_type is float:
+                    schema["type"] = "number"
+
+        return schema
+
+    # list[T] / set[T] / Sequence[T]
+    if origin in (list, set, Sequence):
+        schema = {"type": "array"}
+
+        if args:
+            schema["items"] = _json_schema(args[0])
+
+        return schema
+
+    # tuple[T, ...]
+    #
+    # Intentionally do not use prefixItems for fixed heterogeneous tuples.
+    # That is valid modern JSON Schema, but not worth the compatibility risk
+    # in an LLM tool-calling stack.
+    if origin is tuple:
+        schema = {"type": "array"}
+
+        if args:
+            if len(args) == 2 and args[1] is Ellipsis:
+                schema["items"] = _json_schema(args[0])
+            else:
+                # Conservative fallback for tuple[T1, T2, ...].
+                schema["items"] = {}
+
+        return schema
+
+    # Bare containers.
+    if annotation in (list, set, tuple, Sequence):
+        return {"type": "array"}
+
+    if annotation in (dict, Mapping):
+        return {"type": "object"}
+
+    # dict[K, V] / Mapping[K, V]
+    if origin in (dict, Mapping):
+        schema = {"type": "object"}
+
+        if len(args) == 2:
+            key_type, value_type = args
+
+            # JSON object keys are strings. For dict[str, V], describe the
+            # values precisely via additionalProperties.
+            if key_type is str:
+                schema["additionalProperties"] = _json_schema(value_type)
+            else:
+                # Python allows non-string dict keys, but JSON objects don't.
+                # Don't pretend the key constraint is enforceable here.
+                schema["additionalProperties"] = _json_schema(value_type)
+
+        return schema
+
+    # Bare scalar types.
+    if annotation is str:
+        return {"type": "string"}
+
+    if annotation is bool:
+        return {"type": "boolean"}
+
+    if annotation is int:
+        return {"type": "integer"}
+
+    if annotation is float:
+        return {"type": "number"}
+
+    if annotation is type(None):
+        return {"type": "null"}
+
+    # Date/time-like values.
+    #
+    # Keep these as plain strings rather than relying on JSON Schema "format",
+    # since format validation is not consistently honored by tool backends.
+    if annotation in (date, datetime, UUID):
+        return {"type": "string"}
+
+    # Unknown types: don't lie.
+    #
+    # {} means "unconstrained value", which is preferable to claiming that
+    # an arbitrary Python type is a string.
+    return {}
+
+_PARAM_REGEX = re.compile(r"^\s{0,4}(\w+)\s*(?:\([^)]*\))?:\s*(.*)$")
+def _parameter_descriptions(docstring: str) -> dict[str, str]:
+    """Extract parameter descriptions from an Args/Parameters docstring section."""
+    descriptions = {}
+    in_parameters = False
+    current = None
+
+    for line in inspect.cleandoc(docstring or "").splitlines():
+        clean_line = line.strip().lower().rstrip(":")
+
+        # Detect the start of the parameters section
+        if clean_line in {"args", "arguments", "parameters"}:
+            in_parameters = True
+            continue
+
+        if in_parameters:
+            # Break on known next-sections
+            if clean_line in {"returns", "raises", "yields"}:
+                break
+            # Break on unknown next-sections (unindented text ending in a colon)
+            if line and not line[0].isspace() and line.rstrip().endswith(":"):
+                break
+
+            match = _PARAM_REGEX.match(line)
+            if match:
+                current = match.group(1)
+                descriptions[current] = match.group(2).strip()
+            elif current and line.strip():
+                descriptions[current] += f" {line.strip()}"
+
+    return descriptions
+
+
+def local_tool(func):
+    """Register a local function as an OpenAI-compatible tool."""
+    signature = inspect.signature(func)
+    descriptions = _parameter_descriptions(func.__doc__)
+
+    # Resolve postponed annotations / forward references.
+    #
+    # Falls back to the raw signature annotation if resolution fails, so one
+    # problematic annotation doesn't prevent the tool from registering.
+    try:
+        type_hints = get_type_hints(func)
+    except (NameError, TypeError, ValueError):
+        type_hints = {}
+
+    properties = {}
+    required = []
+
+    for name, parameter in signature.parameters.items():
+        if parameter.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+
+        # Prefer resolved type hints, falling back to the raw annotation.
+        annotation = type_hints.get(name, parameter.annotation)
+
+        # Handle missing type hints explicitly.
+        if annotation is inspect.Parameter.empty:
+            annotation = str
+
+        schema = _json_schema(annotation)
+
+        if name in descriptions:
+            schema["description"] = descriptions[name]
+
+        if parameter.default is not inspect.Parameter.empty:
+            if parameter.default is not None:
+                schema["default"] = parameter.default
+        else:
+            required.append(name)
+
+        properties[name] = schema
+
+    # Ensure there is always a description.
+    doc_text = inspect.cleandoc(func.__doc__ or "")
+    description_part = re.split(
+        r"(?i)\n(?:parameters|args|arguments|returns|yields|raises)"
+        r"\s*(?:\n[-=]+)?\s*\n",
+        doc_text,
+    )[0]
+    description = " ".join(description_part.split())
+
+    if not description:
+        description = f"Executes the {func.__name__} function."
+
+    LOCAL_TOOLS[func.__name__] = {
+        "type": "function",
+        "function": {
+            "name": func.__name__,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    }
+
+    return func
+
+
+@local_tool
 async def get_current_time(timezone: str | None = None) -> str:
     """
-    Returns current date and time as a string.
+    Get the current date and time in the user's timezone. Always use this when the query involves now, today, tomorrow, current time, scheduling, deadlines, recency, etc.
 
-    Args:
-        timezone: Optional IANA timezone name (e.g. 'America/Anchorage', 'Europe/London', 'UTC')
-                 If None, uses the system's local timezone (or fallback to UTC).
+    PARAMETERS
+    ----------
+    timezone (str | None): Optional IANA timezone name e.g. 'America/Anchorage'. Defaults to the user's known timezone.
 
-    Returns:
-        Formatted string like: "2026-03-17 14:55 AKDT"
+    RETURNS
+    -------
+    Formatted string like: "2026-03-17 14:55 AKDT"
     """
+    # Default to system local time
+    tz = datetime.now().astimezone().tzinfo
     if timezone:
         try:
             tz = pytz.timezone(timezone)
         except pytz.exceptions.UnknownTimeZoneError:
-            # Fallback when invalid timezone name is passed
-            tz = pytz.UTC
-            timezone = "UTC (fallback - invalid timezone)"
-    else:
-        # Use system local time if no timezone specified
-        tz = datetime.now().astimezone().tzinfo
-        # or strictly: tz = pytz.utc  ← choose one philosophy
+            pass
 
     now = datetime.now(tz)
 
     # Most readable format for agents & humans
     return now.strftime("%Y-%m-%d %-I:%M:%S %p %Z")
 
-async def local_entity_state(entity_ids: str | list[str]) -> str:
+@local_tool
+async def local_entity_state(entity_ids: list[str]) -> str:
+    """Retrieve the current state and key attributes of one or more entities. Use this tool whenever a question involves the current status, value, location, health, on/off state, brightness, temperature, position, or any real-time property of an entity. Prefer fetching multiple relevant entities in a single call. NOTE: This tool name DOES NOT have a prefix. Call it exactly as 'local_entity_state'
+
+    PARAMETERS
+    ----------
+    entity_ids (list[str]): List of entity IDs to fetch (e.g. ['light.kitchen_ceiling', 'sensor.backyard_temperature']). Use a list even for one entity.
+
+    RETURNS
+    -------
+    A compact JSON object containing the current state of each entity.
+    """
     from . import cache_utils
 
     if isinstance(entity_ids, str):
         entity_ids = [entity_ids]
 
-    result = {}
+    result:dict[str,Any] = {}
     missing = []
 
     for eid in entity_ids:
@@ -259,14 +389,42 @@ async def local_entity_state(entity_ids: str | list[str]) -> str:
     return json.dumps(result, separators=(",", ":"))
 
 
-async def get_current_weather(latitude=None, longitude=None, location=None, timeframe="today"):
+@local_tool
+async def get_current_weather(
+        latitude: float | None = None,
+        longitude: float | None = None,
+        *,
+        location: str | None = None,
+        timeframe: Literal["today", "tomorrow", "this weekend", "7 day"] = "today",
+):
+    """Retrieves real-time weather forecasts from the NWS for a specific sector. Use for current, daily, or weekend forecasts. Provide either latitude and longitude together, or location. Never provide only one coordinate or combine coordinates with location. Prefer latitude and longitude when known.
+
+    Provide either latitude and longitude together, or location. Never provide
+    only one coordinate or combine coordinates with location. Prefer latitude and
+    longitude when they are known because coordinates provide the most precise
+    forecast. Do not provide a partial coordinate pair or both coordinate and
+    location inputs.
+
+    PARAMETERS
+    ----------
+    latitude (float | None): Decimal latitude (e.g., 64.837). Use together with longitude when known.
+    longitude (float | None): Decimal longitude (e.g., -147.716). Use together with latitude when known.
+    location (str | None): City/State name for non-local scans. Use when coordinates are unavailable.
+    timeframe (Literal): The forecast period to retrieve. Defaults to 'today'.
+
+    RETURNS
+    -------
+    A JSON-encoded weather forecast.
+    """
     headers = {"User-Agent": "Starfleet-Command-AVO-Assistant/1.0 (israel@MacStudio)"}
     now = datetime.now() # Mar 19, 2026 (Thursday)
 
     async with httpx.AsyncClient(timeout=20.0) as client:
 
         # 1. Sensor Selection
-        if latitude and longitude:
+        if latitude is not None or longitude is not None:
+            if latitude is None or longitude is None:
+                return "Both latitude and longitude are required when using coordinates."
             # Use direct coordinates (Highest Precision / Lowest Latency)
             lat, lon = latitude, longitude
         elif location:
@@ -275,6 +433,8 @@ async def get_current_weather(latitude=None, longitude=None, location=None, time
             geo_res = await client.get(geo_url, headers=headers)
             if not geo_res.json(): return "Sector not found."
             lat, lon = geo_res.json()[0]["lat"], geo_res.json()[0]["lon"]
+        else:
+            return "Provide either both latitude and longitude or a location."
 
         #  Make sure lat/lon are numbers
         lat = float(lat)
@@ -318,18 +478,22 @@ async def get_current_weather(latitude=None, longitude=None, location=None, time
 ################ MUSIC PLAYBACK USING apple-music-custom ########################
 from .config import ITUNES_URL
 
-async def get_current_playback(server_base_url: str = ITUNES_URL) -> dict[str, Any]:
-    """Get the current playback state from the apple-music-custom server.
+@local_tool
+async def get_current_playback() -> str:
+    """Retrieves the current playback state from Apple Music, including whether something is playing/paused/stopped, the current track details (title, artist, album), playback position, and duration. Use this when the user asks 'what's playing', 'what song is this', or needs context before controlling playback.
 
-    Returns detailed info about what's currently playing (or paused/stopped),
-    including track metadata, artist, album, playback position, state, etc.
+    PARAMETERS
+    ----------
+    None.
 
-    This is the best endpoint for "what's playing right now?" queries.
+    RETURNS
+    -------
+    The current playback state as a JSON object.
     """
     try:
         async with httpx.AsyncClient(timeout=6.0) as client:
             resp = await client.get(
-                f"{server_base_url.rstrip('/')}/now_playing"
+                f"{ITUNES_URL.rstrip('/')}/now_playing"
             )
             resp.raise_for_status()
             data = resp.json()
@@ -361,27 +525,50 @@ async def get_current_playback(server_base_url: str = ITUNES_URL) -> dict[str, A
 
 async def _set_shuffle(enable: bool):
     """
-    Internal helper to set shuffle mode via PUT /shuffle.
-    The body must be 'mode=songs' to enable or 'mode=off' to disable.
+    Internal helper to set shuffle mode via PUT /shuffle. The body must be 'mode=songs' to enable or 'mode=off' to disable.
+
+    PARAMETERS
+    ----------
+    enable (bool): Whether shuffle mode should be enabled.
+
+    RETURNS
+    -------
+    None.
     """
     mode = "songs" if enable else "off"
     async with httpx.AsyncClient() as client:
         await client.put(f"{ITUNES_URL}/shuffle", data={"mode": mode})
 
+@local_tool
 async def pause_music():
     """
-    PUT /pause.
-    Pauses the music.
+    Pauses the music. You MUST call this every time a user asks to pause or stop the music
+
+    PARAMETERS
+    ----------
+    None.
+
+    RETURNS
+    -------
+    The server response.
     """
     async with httpx.AsyncClient() as client:
         response = await client.put(f"{ITUNES_URL}/pause")
         response.raise_for_status()
         return response.text
 
+@local_tool
 async def list_playlists():
     """
-    GET /playlists.
-    Returns all playlists. Use this to map a playlist name to its required 'id'.
+    Retrieves all playlists from the library. Call this tool first to find the 'id' of a playlist when the user refers to one by name or to answer questions about available playlists. Returns a list of playlist objects with 'id' and 'name' properties.
+
+    PARAMETERS
+    ----------
+    None.
+
+    RETURNS
+    -------
+    A list of playlist objects.
     """
     async with httpx.AsyncClient() as client:
         response = await client.get(f"{ITUNES_URL}/playlists")
@@ -390,18 +577,38 @@ async def list_playlists():
 
 async def list_albums(offset: int = 0, limit: int = 100):
     """
-    GET /albums.
-    Returns all albums.
+    Retrieves all albums from the library.
+
+    PARAMETERS
+    ----------
+    offset (int): The offset to use when listing albums.
+    limit (int): The number of albums to return in the result set.
+
+    RETURNS
+    -------
+    A list of album objects.
     """
     async with httpx.AsyncClient() as client:
         response = await client.get(f"{ITUNES_URL}/library/albums", params={"offset": offset, 'limit': limit,})
         response.raise_for_status()
         return response.text
 
-async def search_music(query: str, server_base_url: str = "http://localhost:8181"):
-    """Unified search across cached albums/artists + server track search.
+@local_tool
+async def search_music(query: str, limit: int = 10):
+    """Searches the library for albums, artists, or specific tracks. Use this as the
+    primary tool for finding music when the exact title is unknown or to verify metadata.
+    IMPORTANT:Search using exactly one criterion: a track name, album name, or artist name.
+    Do not combine criteria in a single query. If the user provides multiple pieces
+    of information, search using only the track name.
 
-    Returns candidates in a consistent format so the LLM can pick the best match.
+    PARAMETERS
+    ----------
+    query (str): The search term (e.g., 'Dark Side', 'Pink Floyd', or 'Wish You Were Here').
+    limit (int): Max results to return.
+
+    RETURNS
+    -------
+    Matching albums, artists, and tracks.
     """
     results = {
         'albums': [],
@@ -409,13 +616,13 @@ async def search_music(query: str, server_base_url: str = "http://localhost:8181
         'tracks': [],
     }
 
-    # 1. Fuzzy search on your local album cache
     if cache_utils.itunes_cache.get('albums'):
         album_matches = process.extract(
             query,
             cache_utils.itunes_cache['albums'].keys(),
             scorer=fuzz.WRatio,
             processor=utils.default_process,
+            limit=limit,
         )
         for title, score, _ in album_matches:
             if score > 55:
@@ -423,13 +630,13 @@ async def search_music(query: str, server_base_url: str = "http://localhost:8181
                 item['confidence'] = round(score)
                 results['albums'].append(item)
 
-    # 2. Fuzzy search on your local artist cache
     if cache_utils.itunes_cache.get('artists'):
         artist_matches = process.extract(
             query,
             cache_utils.itunes_cache['artists'].keys(),
             scorer=fuzz.WRatio,
             processor=utils.default_process,
+            limit=limit,
         )
         for name, score, _ in artist_matches:
             if score > 55:
@@ -437,11 +644,10 @@ async def search_music(query: str, server_base_url: str = "http://localhost:8181
                 item['confidence'] = round(score)
                 results['artists'].append(item)
 
-    # 3. Server search for tracks (the missing piece)
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.get(
-                f"{server_base_url.rstrip('/')}/library/search",
+                "http://localhost:8181/library/search",
                 params={"q": query}
             )
             resp.raise_for_status()
@@ -462,21 +668,37 @@ async def search_music(query: str, server_base_url: str = "http://localhost:8181
     return json.dumps(results)
 
 
-
+@local_tool
 async def play_track(track_id: str):
     """
-    PUT /library/tracks/:id/play.
-    Plays a specific track by its persistent ID.
+    Plays a single track by its persistent ID. If the ID is unknown, call search_music first.
+
+    PARAMETERS
+    ----------
+    track_id (str): The persistent ID of the track.
+
+    RETURNS
+    -------
+    The server response.
     """
     async with httpx.AsyncClient() as client:
         response = await client.put(f"{ITUNES_URL}/library/tracks/{track_id}/play")
         response.raise_for_status()
         return response.text
 
+@local_tool
 async def play_playlist(playlist_id: str, shuffle: bool = False):
     """
-    PUT /playlists/:id/play.
-    Starts a playlist. Configures shuffle mode before initiating playback.
+    Plays a playlist by ID. Use list_playlists first to resolve a name to an ID. Support optional shuffling.
+
+    PARAMETERS
+    ----------
+    playlist_id (str): The unique ID of the playlist.
+    shuffle (bool): Whether to shuffle the playlist.
+
+    RETURNS
+    -------
+    The server response.
     """
     await _set_shuffle(shuffle)
     async with httpx.AsyncClient() as client:
@@ -484,10 +706,20 @@ async def play_playlist(playlist_id: str, shuffle: bool = False):
         response.raise_for_status()
         return response.text
 
+@local_tool
 async def play_album(artist_name: str, album_name: str, shuffle: bool = False):
     """
-    PUT /library/albums/:artist/:album/play.
-    Plays an album. Requires exact artist and album names for the URI path.
+    Plays a specific album. Requires exact artist and album names, as returned by search_music. Use search_music first to get the exact names.
+
+    PARAMETERS
+    ----------
+    artist_name (str): The name of the artist.
+    album_name (str): The title of the album.
+    shuffle (bool): Whether to shuffle the album tracks.
+
+    RETURNS
+    -------
+    The server response.
     """
     await _set_shuffle(shuffle)
     # quote() ensures spaces/special characters are safe for the URI path
@@ -498,10 +730,19 @@ async def play_album(artist_name: str, album_name: str, shuffle: bool = False):
         response.raise_for_status()
         return response.text
 
+@local_tool
 async def play_artist(artist_name: str, shuffle: bool = True):
     """
-    PUT /library/artists/:artist/play.
-    Queues all tracks by an artist. Defaults to shuffle enabled for variety.
+    Plays all tracks by a specific artist. Defaults to shuffle mode.
+
+    PARAMETERS
+    ----------
+    artist_name (str): The name of the artist.
+    shuffle (bool): Whether to shuffle the album tracks.
+
+    RETURNS
+    -------
+    The server response.
     """
     await _set_shuffle(shuffle)
     safe_artist = quote(artist_name, safe='')
