@@ -25,6 +25,7 @@ import pytz
 from rapidfuzz import process, fuzz, utils
 
 from . import cache_utils
+from .config import BRAVE_SEARCH_API_KEY
 
 LOCAL_TOOLS = {}
 
@@ -353,6 +354,71 @@ async def get_current_time(timezone: str | None = None) -> str:
 
     # Most readable format for agents & humans
     return now.strftime("%Y-%m-%d %-I:%M:%S %p %Z")
+
+
+@local_tool
+async def brave_search(query: str) -> str:
+    """
+    Query the Brave Answers AI to research current events, recent information, or factual questions.
+    Pass full, natural language questions as the argument. The tool will return a concise, synthesized
+    summary of the most up-to-date web intelligence.
+
+    PARAMETERS
+    ----------
+    query (str): The question or search query to research on the internet.
+
+    RETURNS
+    -------
+    A JSON-encoded Brave Answers response containing the generated answer and supporting search context.
+    """
+    if not BRAVE_SEARCH_API_KEY:
+        return json.dumps({
+            "error": "BRAVE_SEARCH_API_KEY is not configured."
+        })
+
+    payload = {
+        "stream": False,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Answer with the bare minimum needed to answer the user's "
+                    "query accurately. Be extremely concise: no introduction, "
+                    "repetition, explanation, formatting, or conversational "
+                    "filler. Include only essential facts and necessary "
+                    "qualifiers."
+                ),
+            },
+            {"role": "user", "content": query},
+        ],
+    }
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-Subscription-Token": BRAVE_SEARCH_API_KEY,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.search.brave.com/res/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            return json.dumps(response.json())
+    except httpx.HTTPStatusError as exc:
+        return json.dumps({
+            "error": "Brave Answers request failed.",
+            "status_code": exc.response.status_code,
+            "details": exc.response.text,
+        })
+    except httpx.RequestError as exc:
+        return json.dumps({
+            "error": "Unable to reach Brave Answers.",
+            "details": str(exc),
+        })
+
 
 @local_tool
 async def local_entity_state(entity_ids: list[str]) -> str:

@@ -136,9 +136,9 @@ MCP_CLIENT_CONFIG = {
                 # "MCP_HTTP_PORT": "3003"
             # }
         # },
-        "tavily": {
-            "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={config.TAVILY_TOKEN}",
-        },
+        # "tavily": {
+        #     "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={config.TAVILY_TOKEN}",
+        # },
     }
 }
 
