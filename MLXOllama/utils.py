@@ -129,6 +129,10 @@ MCP_CLIENT_CONFIG = {
                 "Authorization": f"Bearer {config.HA_TOKEN}"
             }
         },
+        "web_fetch": {
+            "command": "uvx",
+            "args": ["mcp-server-fetch"]
+        },
         # "searxng-http": {
             # "url": "http://10.27.81.60:3003/mcp",
             # "env": {

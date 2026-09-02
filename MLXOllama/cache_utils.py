@@ -630,12 +630,12 @@ async def _build_cache(model_info:dict, system_prompt:str, tools:list|None, user
         worker_cache = vlm_cache.make_prompt_cache(model.language_model)
 
         with utils.mlx_inference_lock:
-            logits = worker_model(
+            output = worker_model(
                 input_ids=mx.array([worker_tokens]),
                 pixel_values=worker_pixels,
                 cache=worker_cache
             )
-            mx.eval(logits)
+            mx.eval(output.logits)
         return worker_cache
 
     future = inference_worker.submit(_populate_cache, model, prefix_tokens, pixel_values)

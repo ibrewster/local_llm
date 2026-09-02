@@ -376,20 +376,18 @@ async def brave_search(query: str) -> str:
             "error": "BRAVE_SEARCH_API_KEY is not configured."
         })
 
-    payload = {
-        "stream": False,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Answer with the bare minimum needed to answer the user's "
+    system_instructions= ("Answer with the bare minimum needed to answer the user's "
                     "query accurately. Be extremely concise: no introduction, "
                     "repetition, explanation, formatting, or conversational "
                     "filler. Include only essential facts and necessary "
-                    "qualifiers."
-                ),
-            },
-            {"role": "user", "content": query},
+                    "qualifiers.")
+
+    if not query.endswith("?"):
+        query += "?"
+    payload = {
+        "stream": False,
+        "messages": [
+            {"role": "user", "content": f"{query}\n\nQuery: {system_instructions}"},
         ],
     }
     headers = {
@@ -456,20 +454,18 @@ async def local_entity_state(entity_ids: list[str]) -> str:
 
 
 @local_tool
-async def get_current_weather(
+async def get_weather_forecast(
         latitude: float | None = None,
         longitude: float | None = None,
         *,
         location: str | None = None,
         timeframe: Literal["today", "tomorrow", "this weekend", "7 day"] = "today",
 ):
-    """Retrieves real-time weather forecasts from the NWS for a specific sector. Use for current, daily, or weekend forecasts. Provide either latitude and longitude together, or location. Never provide only one coordinate or combine coordinates with location. Prefer latitude and longitude when known.
+    """Retrieves real-time weather forecasts from the NWS for a specific sector.
+Use for current, daily, or weekend forecasts. Provide either latitude and longitude together, or location.
+Never provide only one coordinate or combine coordinates with location. Prefer latitude and longitude when known.
 
-    Provide either latitude and longitude together, or location. Never provide
-    only one coordinate or combine coordinates with location. Prefer latitude and
-    longitude when they are known because coordinates provide the most precise
-    forecast. Do not provide a partial coordinate pair or both coordinate and
-    location inputs.
+The timeframe specifies which forecast period to retrieve.
 
     PARAMETERS
     ----------
