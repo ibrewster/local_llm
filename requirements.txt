@@ -24,3 +24,4 @@ uv
 httpx
 hypercorn
 huggingface-hub
+diskcache

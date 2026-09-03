@@ -788,6 +788,8 @@ async def try_server_tools(tool_calls: list) -> tuple[list[dict], list[dict]]:
     """
     executed = []
     to_forward = []
+    if not utils.MCP_CLIENT.available_tools:
+        await utils.MCP_CLIENT.list_tools()
     server_tools = utils.MCP_CLIENT.available_tools | local_tools.LOCAL_TOOLS.keys()
     for tc in tool_calls:
         fn = tc.get("function", {})

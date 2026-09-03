@@ -1,10 +1,13 @@
 import json
 import inspect
+import logging
 import re
 import types
+import time
 
 from datetime import datetime, timedelta, date
 from enum import Enum
+from pathlib import Path
 from typing import (
     Any,
     Annotated,
@@ -25,10 +28,12 @@ import pytz
 from rapidfuzz import process, fuzz, utils
 
 from . import cache_utils
+from .async_ttl_cache import async_ttl_cache
 from .config import BRAVE_SEARCH_API_KEY
 
 LOCAL_TOOLS = {}
 
+###################### UTILITY FUNCTIONS/DECORATORS ############################
 def _json_schema(annotation: Any) -> dict[str, Any]:
     """Generate a JSON Schema dict from a Python type annotation.
 
@@ -328,7 +333,7 @@ def local_tool(func):
 
     return func
 
-
+############################ TOOLS #############################
 @local_tool
 async def get_current_time(timezone: str | None = None) -> str:
     """
@@ -453,6 +458,45 @@ async def local_entity_state(entity_ids: list[str]) -> str:
     return json.dumps(result, separators=(",", ":"))
 
 
+### Utilities for weather fetching####
+from diskcache import Cache
+CACHE_DIR=Path(__file__).parent / "Cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Cache files
+geo_cache = Cache(CACHE_DIR / "geo_cache")
+grid_cache = Cache(CACHE_DIR / "grid_cache")
+fc_cache = Cache(CACHE_DIR / "fc_cache")
+
+HEADERS = {"User-Agent": "Starfleet-Command-AVO-Assistant/1.0 (israel@MacStudio)"}
+
+@async_ttl_cache(cache=geo_cache, ttl=None,key_fn=lambda location, client: location)
+async def _geocode(location:str, client: httpx.AsyncClient)->tuple[float, float]:
+    """Geocode a location string to latitude and longitude."""
+    logging.warning(f"Geocode cache miss for {location}")
+    geo_url = f"https://nominatim.openstreetmap.org/search?q={location}&format=json&limit=1"
+    response = await client.get(geo_url)
+    response.raise_for_status()
+    data = response.json()
+    if not data:
+        raise ValueError(f"Location not found: {location}")
+
+    return float(data[0]["lat"]), float(data[0]["lon"])
+
+@async_ttl_cache(grid_cache, ttl=None, key_fn=lambda lat, lon, client: f"{lat:.3f},{lon:.3f}")
+async def _grid_forecast_url(lat: float, lon: float, client: httpx.AsyncClient) -> str:
+    logging.warning(f"Grid forecast cache miss for {lat:.3f},{lon:.3f}")
+    res = await client.get(f"https://api.weather.gov/points/{lat:.3f},{lon:.3f}", follow_redirects=True)
+    res.raise_for_status()
+    return res.json()["properties"]["forecast"]
+
+@async_ttl_cache(fc_cache, ttl=1200, key_fn=lambda forecast_url, client: forecast_url)
+async def _forecast_periods(forecast_url: str,client: httpx.AsyncClient) -> list:
+    logging.warning(f"Forecast cache miss for {forecast_url}")
+    res = await client.get(forecast_url)
+    res.raise_for_status()
+    return res.json()["properties"]["periods"]
+
 @local_tool
 async def get_weather_forecast(
         latitude: float | None = None,
@@ -478,64 +522,61 @@ The timeframe specifies which forecast period to retrieve.
     -------
     A JSON-encoded weather forecast.
     """
-    headers = {"User-Agent": "Starfleet-Command-AVO-Assistant/1.0 (israel@MacStudio)"}
+    t0=time.time()
     now = datetime.now() # Mar 19, 2026 (Thursday)
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-
-        # 1. Sensor Selection
+    async with httpx.AsyncClient(timeout=20.0, headers=HEADERS, http2=True) as client:
         if latitude is not None or longitude is not None:
             if latitude is None or longitude is None:
-                return "Both latitude and longitude are required when using coordinates."
+                return json.dumps({
+                    'result': "ERROR",
+                    'content': "Both latitude and longitude are required when using coordinates."
+                })
             # Use direct coordinates (Highest Precision / Lowest Latency)
             lat, lon = latitude, longitude
         elif location:
-            # 1. Geocode
-            geo_url = f"https://nominatim.openstreetmap.org/search?q={location}&format=json&limit=1"
-            geo_res = await client.get(geo_url, headers=headers)
-            if not geo_res.json(): return "Sector not found."
-            lat, lon = geo_res.json()[0]["lat"], geo_res.json()[0]["lon"]
+            # Geocode
+            try:
+                lat, lon = await _geocode(location,client)
+            except (ValueError, httpx.HTTPStatusError) as e:
+                return json.dumps({
+                    'result': "ERROR",
+                    'content': str(e)
+                })
         else:
-            return "Provide either both latitude and longitude or a location."
+            return json.dumps({
+                'result': "ERROR",
+                'content': "Provide either both latitude and longitude or a location."
+            })
 
         #  Make sure lat/lon are numbers
         lat = float(lat)
         lon = float(lon)
 
-        # 2. Get NWS Grid
-        pts_res = await client.get(
-            f"https://api.weather.gov/points/{lat:.3f},{lon:.3f}",
-            headers=headers,
-            follow_redirects=True
-        )
-        if pts_res.status_code != 200:
-            resp = {
-                'result': "ERROR",
-                'content': pts_res.text,
-            }
-            return json.dumps(resp)
+        try:
+            # 2. Get NWS Grid
+            forecast_url = await _grid_forecast_url(lat, lon,client)
+            # 3. Get Full Forecast (Next 7 days)
+            periods = await _forecast_periods(forecast_url,client)
+        except httpx.HTTPStatusError as e:
+            return json.dumps({'result': "ERROR", 'content': str(e)})
 
-        forecast_url = pts_res.json()["properties"]["forecast"]
+    # 4. Temporal Logic: Define "This Weekend"
+    # Since today is Thursday (weekday 3), Friday is +1, Sat is +2, Sun is +3
+    days_to_friday = (4 - now.weekday()) % 7
+    friday_date = (now + timedelta(days=days_to_friday)).date()
+    sunday_date = friday_date + timedelta(days=2)
 
-        # 3. Get Full Forecast (Next 7 days)
-        f_res = await client.get(forecast_url, headers=headers)
-        periods = f_res.json()["properties"]["periods"]
+    logging.info(f"Got weather forecast in {time.time()-t0:.2f} seconds")
+    if timeframe == "this weekend":
+        return json.dumps([p for p in periods if friday_date <=
+                            datetime.fromisoformat(p["startTime"]).date() <= sunday_date])
 
-        # 4. Temporal Logic: Define "This Weekend"
-        # Since today is Thursday (weekday 3), Friday is +1, Sat is +2, Sun is +3
-        days_to_friday = (4 - now.weekday()) % 7
-        friday_date = (now + timedelta(days=days_to_friday)).date()
-        sunday_date = friday_date + timedelta(days=2)
+    if timeframe == "today":
+        return json.dumps([p for p in periods if
+                            datetime.fromisoformat(p["startTime"]).date() == now.date()])
 
-        if timeframe == "this weekend":
-            return json.dumps([p for p in periods if friday_date <=
-                                datetime.fromisoformat(p["startTime"]).date() <= sunday_date])
-
-        if timeframe == "today":
-            return json.dumps([p for p in periods if
-                                datetime.fromisoformat(p["startTime"]).date() == now.date()])
-
-        return json.dumps(periods[:6]) # Default to 3 days (day/night pairs)
+    return json.dumps(periods[:6]) # Default to 3 days (day/night pairs)
 
 ################ MUSIC PLAYBACK USING apple-music-custom ########################
 from .config import ITUNES_URL
