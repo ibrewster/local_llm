@@ -321,7 +321,7 @@ class InferenceOptions:
     processor: Any
     prompt_tokens: list
     cache: Any
-    all_tokens:list
+    base_tokens: list
     model_name: str
     images: list | None = None
 
@@ -338,7 +338,7 @@ async def setup_inference(
     model = model_info['model']
     processor = model_info['processor']
 
-    cache, unprocessed_tokens, all_tokens = await get_cache(
+    cache, unprocessed_tokens, base_tokens = await get_cache(
         model_info, message, tools, thinking, images=images
     )
     cache = copy.deepcopy(cache)
@@ -347,7 +347,7 @@ async def setup_inference(
         processor,
         unprocessed_tokens,
         cache,
-        all_tokens,
+        base_tokens,
         model_info['name'],
         images,
     )
@@ -375,7 +375,7 @@ def submit_inference(
         with utils.tokenizer_lock:
             formatted_prompt = opts.processor.tokenizer.decode(opts.prompt_tokens)
         cache = opts.cache
-        all_tokens=opts.all_tokens
+        base_tokens = opts.base_tokens
         try:
             with utils.mlx_inference_lock:
                 mx.random.seed(int(time.time()))
@@ -397,7 +397,7 @@ def submit_inference(
 
                 cache_utils.dynamic_cache.insert_cache(
                     opts.model_name,
-                    all_tokens,
+                    base_tokens,
                     cache
                 )
             put(("", None, True, None))

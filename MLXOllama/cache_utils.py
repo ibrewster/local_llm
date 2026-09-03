@@ -47,11 +47,20 @@ class VLMCacheLRU:
         cache, prefix = self._manager(model).lookup_exact_cache(tokens)
         if cache is None or prefix == 0:
             return None, tokens
-        return cache, tokens[prefix:]
+        cache_offsets = [
+            int(entry.offset)
+            for entry in cache
+            if hasattr(entry, "offset")
+        ]
+        cached_tokens = min(cache_offsets, default=prefix)
+        consumed = max(prefix, cached_tokens)
+        if consumed > len(tokens):
+            logging.warning("More tokens consumed than available! Falling back to default prefix")
+            return cache, tokens[prefix:]
+        return cache, tokens[consumed:]
 
     def insert_cache(self, model, tokens, cache):
         self._manager(model).store_exact_cache(tokens, cache)
-
 
 dynamic_cache = VLMCacheLRU()
 state_cache = {}
@@ -76,6 +85,7 @@ def make_openwebui_cache_signature(first_prompt: str, tools) -> str:
         default=str,
     )
     return xxhash.xxh64(cache_inputs.encode()).hexdigest()
+
 
 async def get_cache(model_info, messages, tools, thinking:bool=True, images:list|None=None):
     first_content = messages[0].get('content', '')
