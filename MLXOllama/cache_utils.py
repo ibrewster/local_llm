@@ -97,30 +97,30 @@ async def get_cache(model_info, messages, tools, thinking:bool=True, images:list
     def apply_template(
         prompt_messages,
         add_generation_prompt,
-        tools=None,
+        template_tools=None,
         **template_kwargs,
     ):
         return apply_chat_template(
             processor,
             model.config,
             prompt_messages,
-            tools=tools,
+            tools=template_tools,
             enable_thinking=thinking,
             add_generation_prompt=add_generation_prompt,
             **template_kwargs,
         )
 
-    def encode_prompt(prompt_text):
+    def encode_prompt(encoder_text):
         # Keep the textual image placeholder intact. stream_generate passes
         # this decoded prompt to the processor, which expands it exactly once
         # using the actual image's soft-token count.
         with utils.tokenizer_lock:
-            return processor.tokenizer.encode(prompt_text)
+            return processor.tokenizer.encode(encoder_text)
 
     prompt_text = apply_template(
         messages,
         True,
-        tools=tools,
+        template_tools=tools,
         num_images=len(images or []),
     )
     all_tokens = encode_prompt(prompt_text)
@@ -129,7 +129,7 @@ async def get_cache(model_info, messages, tools, thinking:bool=True, images:list
             apply_template(
                 messages,
                 False,
-                tools=tools,
+                template_tools=tools,
                 num_images=len(images or []),
             ),
             add_special_tokens=False,
@@ -138,13 +138,20 @@ async def get_cache(model_info, messages, tools, thinking:bool=True, images:list
     if len(messages) == 1 or messages[0]['role'] != 'system':
         return vlm_cache.make_prompt_cache(model.language_model), all_tokens, base_tokens
 
+        # 1. Try the dynamic cache first (only if no images are involved)
+    if not images:
+        cache, unprocessed_tokens = dynamic_cache.fetch_nearest_cache(model_name, all_tokens)
+        if cache is not None:
+            logging.info("Cache Hit (dynamic)")
+            return cache, unprocessed_tokens, base_tokens
+
+        # 2. If the dynamic cache missed (or was bypassed for images), try the Static Registry
     matched = next((v for k, v in STATIC_CACHE_REGISTRY.items() if k in first_prompt), None)
 
     if matched is not None:
-        # Static cache path — system prompt is pre-cached, remaining tokens are messages[1:]
         cache_hash, factory_fn = matched
-
         cache = static_caches.get(cache_hash)
+
         if cache is None:
             logging.info("Cache Miss (static)")
             cache = await factory_fn(model_info, first_prompt, tools)
@@ -152,7 +159,6 @@ async def get_cache(model_info, messages, tools, thinking:bool=True, images:list
             logging.info("Cache Hit (static)")
 
         static_caches[cache_hash] = cache  # Bump TTL
-
         task = asyncio.create_task(_save_static_caches())
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
@@ -160,50 +166,29 @@ async def get_cache(model_info, messages, tools, thinking:bool=True, images:list
         unprocessed_tokens = encode_prompt(
             apply_template(messages[1:], True, num_images=len(images or []))
         )
+        return cache, unprocessed_tokens, base_tokens
 
-    else:
-        # Dynamic path — delegate cache locality to LRUPromptCache
-        if images:
-            # The generic token-only APC lookup cannot distinguish two images
-            # with identical surrounding text. Reuse the system-prefix cache,
-            # while letting the processor handle the image-bearing suffix.
-            logging.info("Image request: using system-prefix KV cache")
-            cache = await _build_cache(model_info, first_prompt, tools, thinking=thinking)
-            unprocessed_tokens = encode_prompt(
-                apply_template(messages[1:], True, num_images=len(images))
-            )
-            return cache, unprocessed_tokens, base_tokens
-
-        cache, unprocessed_tokens = dynamic_cache.fetch_nearest_cache(model_name, all_tokens)
-
-        if cache is None:
-            # Keep the usual system-prefix KV cache. The image belongs to the
-            # user-message suffix and is supplied to stream_generate below.
-            if is_openwebui and tools:
-                cache_signature = make_openwebui_cache_signature(first_prompt, tools)
-                cache = static_caches.get('OPENWEBUI')
-                if (
-                    cache is None
-                    or static_cache_metadata.get('OPENWEBUI') != cache_signature
-                ):
-                    if cache is not None:
-                        logging.info("OpenWebUI cache invalidated (prompt or tools changed)")
-                    logging.info("Cache Miss (OpenWebUI)")
-                    cache = await create_openwebui_cache(
-                        model_info, first_prompt, tools, cache_signature
-                    )
-                else:
-                    logging.info("Cache Hit (OpenWebUI)")
-            else:
-                logging.info("Cache Miss (dynamic)")
-                cache = await _build_cache(model_info, first_prompt, tools, thinking=thinking)
-            unprocessed_tokens = encode_prompt(
-                apply_template(messages[1:], True, num_images=len(images or []))
-            )
+    # 3. Fallbacks: OpenWebUI pinned cache or full dynamic rebuild
+    if is_openwebui and tools:
+        cache_signature = make_openwebui_cache_signature(first_prompt, tools)
+        cache = static_caches.get('OPENWEBUI')
+        if cache is None or static_cache_metadata.get('OPENWEBUI') != cache_signature:
+            if cache is not None:
+                logging.info("OpenWebUI cache invalidated (prompt or tools changed)")
+            logging.info("Cache Miss (OpenWebUI)")
+            cache = await create_openwebui_cache(model_info, first_prompt, tools, cache_signature)
         else:
-            logging.info("Cache Hit (dynamic)")
+            logging.info("Cache Hit (OpenWebUI)")
+    else:
+        logging.info("Cache Miss (dynamic/fallback)")
+        cache = await _build_cache(model_info, first_prompt, tools, thinking=thinking)
+
+    unprocessed_tokens = encode_prompt(
+        apply_template(messages[1:], True, num_images=len(images or []))
+    )
 
     return cache, unprocessed_tokens, base_tokens
+
 
 def make_cache_key(model_name: str, messages: list) -> str:
     content = model_name + "".join(m["content"] for m in messages)

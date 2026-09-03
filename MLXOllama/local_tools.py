@@ -459,18 +459,7 @@ async def local_entity_state(entity_ids: list[str]) -> str:
 
 
 ### Utilities for weather fetching####
-from diskcache import Cache
-CACHE_DIR=Path(__file__).parent / "Cache"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-# Cache files
-geo_cache = Cache(CACHE_DIR / "geo_cache")
-grid_cache = Cache(CACHE_DIR / "grid_cache")
-fc_cache = Cache(CACHE_DIR / "fc_cache")
-
-HEADERS = {"User-Agent": "Starfleet-Command-AVO-Assistant/1.0 (israel@MacStudio)"}
-
-@async_ttl_cache(cache=geo_cache, ttl=None,key_fn=lambda location, client: location)
+@async_ttl_cache(ttl=None, key_fn=lambda location, client: location)
 async def _geocode(location:str, client: httpx.AsyncClient)->tuple[float, float]:
     """Geocode a location string to latitude and longitude."""
     logging.warning(f"Geocode cache miss for {location}")
@@ -483,19 +472,26 @@ async def _geocode(location:str, client: httpx.AsyncClient)->tuple[float, float]
 
     return float(data[0]["lat"]), float(data[0]["lon"])
 
-@async_ttl_cache(grid_cache, ttl=None, key_fn=lambda lat, lon, client: f"{lat:.3f},{lon:.3f}")
+@async_ttl_cache(ttl=None, key_fn=lambda lat, lon, client: f"{lat:.3f},{lon:.3f}")
 async def _grid_forecast_url(lat: float, lon: float, client: httpx.AsyncClient) -> str:
     logging.warning(f"Grid forecast cache miss for {lat:.3f},{lon:.3f}")
     res = await client.get(f"https://api.weather.gov/points/{lat:.3f},{lon:.3f}", follow_redirects=True)
     res.raise_for_status()
     return res.json()["properties"]["forecast"]
 
-@async_ttl_cache(fc_cache, ttl=1200, key_fn=lambda forecast_url, client: forecast_url)
+@async_ttl_cache(ttl=1200, key_fn=lambda forecast_url, client: forecast_url)
 async def _forecast_periods(forecast_url: str,client: httpx.AsyncClient) -> list:
     logging.warning(f"Forecast cache miss for {forecast_url}")
     res = await client.get(forecast_url)
     res.raise_for_status()
     return res.json()["properties"]["periods"]
+
+# Helper to strip the NWS fat
+def _trim_period(p):
+    return {
+        "time": p.get("name"), # e.g., "Saturday Night"
+        "forecast": p.get("detailedForecast")
+    }
 
 @local_tool
 async def get_weather_forecast(
@@ -525,7 +521,8 @@ The timeframe specifies which forecast period to retrieve.
     t0=time.time()
     now = datetime.now() # Mar 19, 2026 (Thursday)
 
-    async with httpx.AsyncClient(timeout=20.0, headers=HEADERS, http2=True) as client:
+    weather_headers = {"User-Agent": "Starfleet-Command-AVO-Assistant/1.0 (israel@MacStudio)"}
+    async with httpx.AsyncClient(timeout=20.0, headers=weather_headers, http2=True) as client:
         if latitude is not None or longitude is not None:
             if latitude is None or longitude is None:
                 return json.dumps({
@@ -561,22 +558,19 @@ The timeframe specifies which forecast period to retrieve.
         except httpx.HTTPStatusError as e:
             return json.dumps({'result': "ERROR", 'content': str(e)})
 
-    # 4. Temporal Logic: Define "This Weekend"
-    # Since today is Thursday (weekday 3), Friday is +1, Sat is +2, Sun is +3
-    days_to_friday = (4 - now.weekday()) % 7
-    friday_date = (now + timedelta(days=days_to_friday)).date()
-    sunday_date = friday_date + timedelta(days=2)
-
     logging.info(f"Got weather forecast in {time.time()-t0:.2f} seconds")
     if timeframe == "this weekend":
-        return json.dumps([p for p in periods if friday_date <=
+        days_to_friday = (4 - now.weekday()) % 7
+        friday_date = (now + timedelta(days=days_to_friday)).date()
+        sunday_date = friday_date + timedelta(days=2)
+        return json.dumps([_trim_period(p) for p in periods if friday_date <=
                             datetime.fromisoformat(p["startTime"]).date() <= sunday_date])
 
     if timeframe == "today":
-        return json.dumps([p for p in periods if
+        return json.dumps([_trim_period(p) for p in periods if
                             datetime.fromisoformat(p["startTime"]).date() == now.date()])
 
-    return json.dumps(periods[:6]) # Default to 3 days (day/night pairs)
+    return json.dumps([_trim_period(p) for p in periods[:6]]) # Default to 3 days (day/night pairs)
 
 ################ MUSIC PLAYBACK USING apple-music-custom ########################
 from .config import ITUNES_URL

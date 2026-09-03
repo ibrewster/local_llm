@@ -341,7 +341,7 @@ async def setup_inference(
     cache, unprocessed_tokens, all_tokens = await get_cache(
         model_info, message, tools, thinking, images=images
     )
-    cache = copy.copy(cache)
+    cache = copy.deepcopy(cache)
     return InferenceOptions(
         model,
         processor,
@@ -742,7 +742,6 @@ async def generate_stream(stream, model_info, msg_history, options,
                         "If the information is incomplete, acknowledge that clearly in your response."
                     )
                 })
-
         else:
             break
 
