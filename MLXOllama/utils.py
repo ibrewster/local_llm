@@ -267,6 +267,7 @@ def base_model_entry(model_info: dict) -> dict:
         "size": model_size(repo_id),
         "digest": model_digest(repo_id),
         "details": model_details(model_info['name']),
+        "capabilities": ["completion", "vision", "tools"],
     }
 
 def embed_model_entry() -> dict:
@@ -284,6 +285,7 @@ def embed_model_entry() -> dict:
             "parameter_size": "22.7M",
             "quantization_level": "fp32",
         },
+        "capabilities": ["embedding"],
     }
 
 def extract_embed_inputs(data: dict) -> list[str]:

@@ -77,6 +77,7 @@ async def api_show():
                 "bert.block_count": 6,
                 "bert.attention.head_count": 12,
             },
+            "capabilities": ["embedding"],
         })
 
     if name not in utils.loaded_models:
@@ -99,6 +100,7 @@ async def api_show():
             "qwen2.attention.head_count": model_config.get("num_attention_heads"),
             "qwen2.attention.head_count_kv": model_config.get("num_key_value_heads"),
         },
+        "capabilities": ["completion", "vision", "tools"],
     })
 
 @app.route("/api/ps")
