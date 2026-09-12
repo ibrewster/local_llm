@@ -1,6 +1,7 @@
 import base64
 import json
 import time
+import uuid
 from typing import Any, Mapping, cast
 
 import quart
@@ -33,6 +34,29 @@ def _options(data: Mapping[str, Any]) -> JsonObject:
     return options
 
 
+def _format_tool_calls(
+    tool_calls: list[dict[str, Any]],
+    for_stream: bool = False,
+) -> list[dict[str, Any]]:
+    formatted = []
+    for idx, tc in enumerate(tool_calls):
+        fn = tc.get("function", {})
+        args = fn.get("arguments", {})
+        args_str = json.dumps(args) if isinstance(args, dict) else str(args or "{}")
+        item: dict[str, Any] = {
+            "id": tc.get("id", f"call_{uuid.uuid4().hex[:10]}"),
+            "type": "function",
+            "function": {
+                "name": fn.get("name", ""),
+                "arguments": args_str,
+            },
+        }
+        if for_stream:
+            item["index"] = idx
+        formatted.append(item)
+    return formatted
+
+
 def _chunk(
     chunk: Mapping[str, Any],
     model_name: str,
@@ -48,11 +72,12 @@ def _chunk(
     if message.get("content"):
         delta["content"] = message["content"]
     if message.get("tool_calls"):
-        delta["tool_calls"] = message["tool_calls"]
+        delta["tool_calls"] = _format_tool_calls(message["tool_calls"], for_stream=True)
 
     choice: JsonObject = {"index": 0, "delta": delta}
     if chunk.get("done"):
-        choice["finish_reason"] = "tool_calls" if message.get("tool_calls") else "stop"
+        done_reason = chunk.get("done_reason")
+        choice["finish_reason"] = "tool_calls" if message.get("tool_calls") or done_reason == "tool_call" else "stop"
     else:
         choice["finish_reason"] = None
     return {
@@ -103,6 +128,13 @@ async def chat_completions() -> Any:
             JsonObject,
             final_chunk.get("message", {"role": "assistant", "content": ""}),
         )
+
+        if message.get("tool_calls"):
+            message["tool_calls"] = _format_tool_calls(message["tool_calls"], for_stream=False)
+            if not message.get("content"):
+                message["content"] = None
+
+        finish_reason = "tool_calls" if message.get("tool_calls") or final_chunk.get("done_reason") == "tool_call" else "stop"
         completion: JsonObject = {
             "id": request_id,
             "object": "chat.completion",
@@ -111,7 +143,7 @@ async def chat_completions() -> Any:
             "choices": [{
                 "index": 0,
                 "message": message,
-                "finish_reason": "tool_calls" if message.get("tool_calls") else "stop",
+                "finish_reason": finish_reason,
             }],
         }
         prompt_tokens = final_chunk.get("prompt_eval_count")

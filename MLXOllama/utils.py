@@ -383,7 +383,7 @@ def parse_tool_calls(text: str) -> tuple[Optional[List[Dict]], str]:
 
         # Replace <|"|> string delimiters, then quote bare keys
         args_str = args_str.replace('<|"|>', '"')
-        args_str = re.sub(r'(?<!["\w])(\w+)\s*:', r'"\1":', args_str)
+        args_str = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', args_str)
 
         try:
             args = json.loads(args_str)

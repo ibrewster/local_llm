@@ -9,6 +9,8 @@ import quart
 import sounddevice as sd
 import soundfile as sf
 
+from sentence_transformers import SentenceTransformer
+
 from . import app, speak_queue, config, utils, worker, cache_utils
 from .common import images_from_messages, message_text, read_chat_request
 assert app is not None #because we couldn't be here if it was
@@ -299,20 +301,44 @@ async def api_pull():
         yield json.dumps({"status": "success"}) + "\n"
     return quart.Response(pull_stream(), mimetype="application/x-ndjson")
 
-@app.route("/api/embed", methods=["POST"])
+
+embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+
+@app.route("/v1/embeddings", methods=["POST"])
 @app.route("/api/embeddings", methods=["POST"])
 async def api_embeddings():
-    """
-    Embeddings are not supported — return a 503, so clients fail loudly
-    rather than silently consuming zero-vectors.
-    If you ever need this, consider mlx-embeddings with a dedicated
-    model like mlx-community/nomic-embed-text-v1.5
-    """
     data = await quart.request.get_json()
-    model = data.get("model", config.QUICK_MODEL)
+
+    # The OpenAI spec allows input to be a single string or a list of strings
+    inputs = data.get("input", [])
+    if isinstance(inputs, str):
+        inputs = [inputs]
+
+    # Run the blocking encoding operation in a separate thread so it doesn't stall Quart
+    vectors = await asyncio.to_thread(embed_model.encode, inputs)
+
+    # .tolist() converts the numpy arrays to standard python floats for JSON serialization
+    vectors_list = vectors.tolist()
+
+    # Format the response to match the OpenAI API specification exactly
+    response_data = []
+    for i, vector in enumerate(vectors_list):
+        response_data.append({
+            "object": "embedding",
+            "index": i,
+            "embedding": vector
+        })
+
     return quart.jsonify({
-        "error": f"Embedding model not available. '{model}' is a generation model only."
-    }), 503
+        "object": "list",
+        "data": response_data,
+        "model": data.get("model", "all-MiniLM-L6-v2"),
+        "usage": {
+            "prompt_tokens": 0,  # Most clients ignore token counts for embeddings
+            "total_tokens": 0
+        }
+    }), 200
         
 _whisper_process: multiprocessing.Process | None = None
 

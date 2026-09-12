@@ -1,3 +1,5 @@
+parakeet-mlx
+sentence_transformers
 wyoming-mlx-whisper
 quart
 cachetools

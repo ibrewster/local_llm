@@ -608,6 +608,9 @@ async def generate_stream(stream, model_info, msg_history, options,
                 pass
 
 
+    last_remaining_calls = None
+    last_cleaned_text = None
+
     for iteration in range(config.MAX_TOOL_CALLS):
         t2 = time.time()
         full_text = ""
@@ -695,34 +698,37 @@ async def generate_stream(stream, model_info, msg_history, options,
         if not tool_calls or is_gen:
             break
         
-        if "<channel|>" in cleaned_text:
-            if think:
-                # Replace channel with thought
-                cleaned_text = cleaned_text.replace('<channel|>', '</thought>\n')
-                cleaned_text = cleaned_text.replace('<|channel>', '<thought>\n')
-            else:
-                # Remove everything in the channel tags
-                cleaned_text = re.sub(r'(<\|channel>.*?)?<channel\|>', '', cleaned_text, flags=re.DOTALL)       
+        if think:
+            cleaned_text = cleaned_text.replace('<channel|>', '</thought>\n')
+            cleaned_text = cleaned_text.replace('<|channel>', '<thought>\n')
+        else:
+            cleaned_text = re.sub(r'<\|channel>.*?<channel\|>', '', cleaned_text, flags=re.DOTALL)
+            cleaned_text = re.sub(r'<think>.*?</think>', '', cleaned_text, flags=re.DOTALL)
+            cleaned_text = re.sub(r'<\|?channel\|?>', '', cleaned_text)
+            cleaned_text = cleaned_text.strip()
 
         executed_msgs, remaining_calls = await try_server_tools(tool_calls)
 
         if remaining_calls:
+            last_remaining_calls = remaining_calls
+            last_cleaned_text = cleaned_text
             # Forward only what's left
             done = False if executed_msgs else True
-            msg = {
-                "model": model_name,
-                "created_at": utils.now_iso(),
-                "message": {
-                    "role": "assistant",
-                    "content": cleaned_text or "",
-                    "tool_calls": remaining_calls,
-                },
-                "done": done,
-            }
-            if done:
-                msg["done_reason"] = "tool_call"
+            if stream:
+                msg = {
+                    "model": model_name,
+                    "created_at": utils.now_iso(),
+                    "message": {
+                        "role": "assistant",
+                        "content": cleaned_text or "",
+                        "tool_calls": remaining_calls,
+                    },
+                    "done": done,
+                }
+                if done:
+                    msg["done_reason"] = "tool_call"
 
-            yield json.dumps(msg) + "\n"
+                yield json.dumps(msg) + "\n"
 
         if executed_msgs:
             msg_history.append({
@@ -750,7 +756,7 @@ async def generate_stream(stream, model_info, msg_history, options,
     stats_fields = {
         "model": model_name,
         "done": True,
-        "done_reason": "stop",
+        "done_reason": "tool_call" if last_remaining_calls else "stop",
         "created_at": utils.now_iso(),
         "eval_count": stats.get("eval_count") if stats else None,
         "eval_duration": stats.get("eval_duration") if stats else None,
@@ -759,7 +765,14 @@ async def generate_stream(stream, model_info, msg_history, options,
         "total_duration": total_time,
         "load_duration": 0,
     }
-    assistant_resp = {"role": "assistant", "content": full_text}
+    if last_remaining_calls:
+        assistant_resp = {
+            "role": "assistant",
+            "content": last_cleaned_text or "",
+            "tool_calls": last_remaining_calls,
+        }
+    else:
+        assistant_resp = {"role": "assistant", "content": full_text}
     if is_gen:
         msg_history.append(assistant_resp)
         new_key = hash(tuple(state['context']))
