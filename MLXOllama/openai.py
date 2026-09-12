@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import time
@@ -172,3 +173,59 @@ async def chat_completions() -> Any:
     response.timeout = None
     response.headers["Cache-Control"] = "no-cache"
     return response
+
+
+@app.get("/v1/models")
+async def list_models() -> Any:
+    models = []
+    for model_info in utils.loaded_models.values():
+        model = {
+            "id": model_info['name'],
+            'object': "model",
+            "created": 1690000000,
+            "owned_by": "mlx-vlm",
+        }
+        models.append(model)
+
+    models.append({
+        "id": utils.EMBED_MODEL_NAME,
+        "object": "model",
+        "created": 1690000000,
+        "owned_by": "sentence-transformers",
+    })
+
+    return {
+        "object": "list",
+        "data": models
+    }
+
+
+@app.route("/v1/embeddings", methods=["POST"])
+async def embeddings() -> Any:
+    data = await quart.request.get_json() or {}
+    inputs = utils.extract_embed_inputs(data)
+    if not inputs:
+        return _error("'input' is required and must not be empty", 400, "invalid_request_error")
+
+    model_name = data.get("model", utils.EMBED_MODEL_NAME)
+    vectors = await asyncio.to_thread(utils.embed_model.encode, inputs)
+    vectors_list = vectors.tolist()
+
+    response_data = [
+        {
+            "object": "embedding",
+            "index": i,
+            "embedding": vector,
+        }
+        for i, vector in enumerate(vectors_list)
+    ]
+
+    return quart.jsonify({
+        "object": "list",
+        "data": response_data,
+        "model": model_name,
+        "usage": {
+            "prompt_tokens": 0,
+            "total_tokens": 0,
+        },
+    }), 200

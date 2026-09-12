@@ -22,10 +22,14 @@ from cachetools import TTLCache
 from huggingface_hub import snapshot_download
 from mlx_vlm import sample_utils, load
 from mlx_vlm.utils import load_config
+from sentence_transformers import SentenceTransformer
 
 from . import config, mcp_client
 
 ##### GLOBAL OBJECTS#######
+EMBED_MODEL_NAME = 'all-MiniLM-L6-v2'
+embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+
 cache_lock = Lock()
 # Hugging Face's fast tokenizer is backed by a Rust object whose mutable
 # internals cannot be borrowed by two threads at once.  The processor/tokenizer
@@ -264,6 +268,32 @@ def base_model_entry(model_info: dict) -> dict:
         "digest": model_digest(repo_id),
         "details": model_details(model_info['name']),
     }
+
+def embed_model_entry() -> dict:
+    return {
+        "name": EMBED_MODEL_NAME,
+        "model": EMBED_MODEL_NAME,
+        "modified_at": "2024-01-01T00:00:00.000Z",
+        "size": 90900000,
+        "digest": "sha256:all-minilm-l6-v2",
+        "details": {
+            "parent_model": "",
+            "format": "safetensors",
+            "family": "bert",
+            "families": ["bert"],
+            "parameter_size": "22.7M",
+            "quantization_level": "fp32",
+        },
+    }
+
+def extract_embed_inputs(data: dict) -> list[str]:
+    """Extract and normalize inputs from OpenAI or Ollama embedding request payloads."""
+    raw = data.get("input") if "input" in data else data.get("prompt", [])
+    if isinstance(raw, str):
+        return [raw] if raw else []
+    if isinstance(raw, list):
+        return [str(x) for x in raw if x is not None]
+    return []
 
 def model_modified_at(repo_id) -> str:
     """Use the mtime of config.json in the snapshot as a proxy for 'last modified'."""

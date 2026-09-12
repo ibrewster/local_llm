@@ -9,8 +9,6 @@ import quart
 import sounddevice as sd
 import soundfile as sf
 
-from sentence_transformers import SentenceTransformer
-
 from . import app, speak_queue, config, utils, worker, cache_utils
 from .common import images_from_messages, message_text, read_chat_request
 assert app is not None #because we couldn't be here if it was
@@ -56,30 +54,31 @@ async def api_version():
 @app.route("/api/tags")
 async def api_tags():
     models = [utils.base_model_entry(info) for info in utils.loaded_models.values()]
+    models.append(utils.embed_model_entry())
     return quart.jsonify({"models": models})
-
-@app.get("/v1/models")
-async def list_models():
-    models = []
-    for model_info in utils.loaded_models.values():
-        model = {
-            "id": model_info['name'],
-            'object': "model",
-            "created": 1690000000,
-            "owned_by": "mlx-vlm",
-        }
-        models.append(model)
-        
-    return {
-        "object": "list",
-        "data": models
-    }
 
 
 @app.route("/api/show", methods=["POST"])
 async def api_show():
-    data = await quart.request.get_json()
+    data = await quart.request.get_json() or {}
     name = data.get("name", config.QUICK_MODEL)
+
+    if name == utils.EMBED_MODEL_NAME or name.lower() == utils.EMBED_MODEL_NAME.lower():
+        return quart.jsonify({
+            "modelfile": f"FROM sentence-transformers/{utils.EMBED_MODEL_NAME}",
+            "parameters": "",
+            "template": "",
+            "details": utils.embed_model_entry()["details"],
+            "model_info": {
+                "general.architecture": "bert",
+                "general.parameter_count": 22713216,
+                "bert.context_length": 256,
+                "bert.embedding_length": 384,
+                "bert.block_count": 6,
+                "bert.attention.head_count": 12,
+            },
+        })
+
     if name not in utils.loaded_models:
         return quart.jsonify({"error": f"model '{name}' not found"}), 404
     
@@ -114,6 +113,13 @@ async def api_ps():
         })
         entries.append(entry)
         
+    embed_entry = utils.embed_model_entry()
+    embed_entry.update({
+        "expires_at": "2099-12-31T00:00:00Z",
+        "size_vram": 0,
+    })
+    entries.append(embed_entry)
+
     return quart.jsonify({"models": entries})
 
 @app.route("/api/blobs/<digest>", methods=["HEAD"])
@@ -302,42 +308,38 @@ async def api_pull():
     return quart.Response(pull_stream(), mimetype="application/x-ndjson")
 
 
-embed_model = SentenceTransformer('all-MiniLM-L6-v2')
-
-
-@app.route("/v1/embeddings", methods=["POST"])
 @app.route("/api/embeddings", methods=["POST"])
 async def api_embeddings():
-    data = await quart.request.get_json()
+    data = await quart.request.get_json() or {}
+    inputs = utils.extract_embed_inputs(data)
+    if not inputs:
+        return quart.jsonify({"error": "prompt is required"}), 400
 
-    # The OpenAI spec allows input to be a single string or a list of strings
-    inputs = data.get("input", [])
-    if isinstance(inputs, str):
-        inputs = [inputs]
-
-    # Run the blocking encoding operation in a separate thread so it doesn't stall Quart
-    vectors = await asyncio.to_thread(embed_model.encode, inputs)
-
-    # .tolist() converts the numpy arrays to standard python floats for JSON serialization
+    vectors = await asyncio.to_thread(utils.embed_model.encode, inputs)
     vectors_list = vectors.tolist()
 
-    # Format the response to match the OpenAI API specification exactly
-    response_data = []
-    for i, vector in enumerate(vectors_list):
-        response_data.append({
-            "object": "embedding",
-            "index": i,
-            "embedding": vector
-        })
+    return quart.jsonify({
+        "embedding": vectors_list[0] if vectors_list else []
+    }), 200
+
+
+@app.route("/api/embed", methods=["POST"])
+async def api_embed():
+    data = await quart.request.get_json() or {}
+    inputs = utils.extract_embed_inputs(data)
+    if not inputs:
+        return quart.jsonify({"error": "input is required"}), 400
+
+    model_name = data.get("model", utils.EMBED_MODEL_NAME)
+    vectors = await asyncio.to_thread(utils.embed_model.encode, inputs)
+    vectors_list = vectors.tolist()
 
     return quart.jsonify({
-        "object": "list",
-        "data": response_data,
-        "model": data.get("model", "all-MiniLM-L6-v2"),
-        "usage": {
-            "prompt_tokens": 0,  # Most clients ignore token counts for embeddings
-            "total_tokens": 0
-        }
+        "model": model_name,
+        "embeddings": vectors_list,
+        "total_duration": 0,
+        "load_duration": 0,
+        "prompt_eval_count": 0
     }), 200
         
 _whisper_process: multiprocessing.Process | None = None
