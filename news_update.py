@@ -56,7 +56,10 @@ Additional Significant News
                             },
                             "summary": {
                                 "type": "string",
-                                "description": "A brief summary of the news story"
+                                "description":     "A concise, information-dense summary, normally 2–3 sentences. "
+    "Include all important facts, context, names, numbers, developments, "
+    "and consequences needed to understand the story. "
+    "Use an additional sentence when necessary to avoid omitting significant information."
                             }
                         }
                     }
@@ -74,7 +77,10 @@ Additional Significant News
                             },
                             "summary": {
                                 "type": "string",
-                                "description": "A brief summary of the news story"
+                                "description":     "A concise, information-dense summary, normally 2–3 sentences. "
+    "Include all important facts, context, names, numbers, developments, "
+    "and consequences needed to understand the story. "
+    "Use an additional sentence when necessary to avoid omitting significant information."
                             }
                         }
                     }
@@ -92,7 +98,10 @@ Additional Significant News
                             },
                             "summary": {
                                 "type": "string",
-                                "description": "A brief summary of the local news story"
+                                "description":     "A concise, information-dense summary, normally 2–3 sentences. "
+    "Include all important facts, context, names, numbers, developments, "
+    "and consequences needed to understand the story. "
+    "Use an additional sentence when necessary to avoid omitting significant information."
                             }
                         }
                     }

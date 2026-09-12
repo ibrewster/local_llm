@@ -5,8 +5,12 @@ setproctitle.setproctitle("HermesMLX")
 import asyncio
 import logging
 import multiprocessing
-import signal
 import os
+import signal
+import subprocess
+import threading
+
+from pathlib import Path
 
 from hypercorn.config import Config
 from hypercorn.asyncio import serve
@@ -24,13 +28,51 @@ signal.signal(signal.SIGTERM, _sigterm_handler)
 if __name__ == "__main__":    
     logging.info("Starting Whisper Server")
     spawn_context = multiprocessing.get_context('spawn')
-    _whisper_process = spawn_context.Process(
-        target=run_whisper_process,
-        daemon=True,
-        name="wyoming-mlx-whisper"
+    # _whisper_process = spawn_context.Process(
+    #     target=run_whisper_process,
+    #     daemon=True,
+    #     name="wyoming-mlx-whisper"
+    # )
+    # _whisper_process.start()
+
+    parakeet_path=Path(__file__).parent / "wyoming-parakeet-mlx"
+    parakeet_py = parakeet_path /".venv"/"bin"/"python"
+    URI = "tcp://0.0.0.0:10300"
+    MODEL = "mlx-community/parakeet-tdt-0.6b-v2"
+
+    logging.info(f"Starting Parakeet process from {parakeet_py}")
+    cmd = [
+        str(parakeet_py),
+        "-u",
+        "-m", "wyoming_parakeet_mlx",
+        "--uri", URI,
+        "--model", MODEL,
+        "--debug",          # uncomment if you want verbose logs
+    ]
+
+    parakeet_process = subprocess.Popen(
+        cmd,
+        cwd=str(parakeet_path),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        text=True,
+        start_new_session=False,
     )
-    _whisper_process.start()
-    logging.info("Whisper process PID: %d", _whisper_process.pid)
+
+    logging.info("Parakeet process PID: %d", parakeet_process.pid)
+
+    def log_parakeet_output():
+        assert parakeet_process.stdout is not None
+
+        for line in parakeet_process.stdout:
+            logging.info("Parakeet: %s", line.rstrip())
+
+    threading.Thread(
+        target=log_parakeet_output,
+        name="parakeet-logger",
+        daemon=True,
+    ).start()
     
     logging.info("Starting TTS process")
     MLXOllama.tts_queue = multiprocessing.Queue()
@@ -53,13 +95,17 @@ if __name__ == "__main__":
     MLXOllama.speak_queue.put("QUIT")
     MLXOllama.process_thread.join()
     
-    if _whisper_process and _whisper_process.is_alive():
-        MLXOllama.app.logger.info("Shutting down Whisper Process...")        
-        _whisper_process.terminate()
-        _whisper_process.join(timeout=5)
-        if _whisper_process.is_alive():
-            _whisper_process.kill()
-        MLXOllama.app.logger.info("Whisper process stopped")
+    if parakeet_process and parakeet_process.poll() is None:
+        MLXOllama.app.logger.info("Shutting down Parakeet Process...")
+        parakeet_process.terminate()
+        try:
+            parakeet_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logging.warning("Parakeet process did not terminate within 5 seconds. Killing...")
+            parakeet_process.kill()
+            parakeet_process.wait()
+
+        MLXOllama.app.logger.info("Parakeet process stopped")
         
     if tts_process and tts_process.is_alive():
         MLXOllama.app.logger.info("Shutting down Speaker process")
