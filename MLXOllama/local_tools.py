@@ -359,8 +359,9 @@ async def get_current_time(timezone: str | None = None) -> str:
     # Most readable format for agents & humans
     return now.strftime("%Y-%m-%d %-I:%M:%S %p %Z")
 
+
 @local_tool
-async def get_notifications() -> dict[str, Any]:
+async def get_notifications() -> str:
     """Retrieves unread smart home notifications, alerts, or messages. Use this tool whenever the user asks for their notifications, alerts, or messages (e.g., "What are my notifications?", "Read my messages", "Do I have any alerts?").
 
     CRITICAL: The returned text in the 'data' field already has a specific theatrical persona applied. You MUST output this exact 'data' string to the user verbatim without summarizing, adding introductory text, or applying any additional personality.
@@ -371,7 +372,7 @@ async def get_notifications() -> dict[str, Any]:
 
     RETURNS
     -------
-    dict: A dictionary containing the notification status and pre-formatted text payload.
+    str: A JSON-encoded string containing the notification status and pre-formatted text payload.
     """
 
     # Secrets and config are handled by the host environment, completely hidden from the LLM
@@ -397,10 +398,12 @@ async def get_notifications() -> dict[str, Any]:
         # from the HA API response to match the clean schema returned to the LLM.
         raw_ha_response = response.json()
 
-        return raw_ha_response.get("service_response") or raw_ha_response.get("response", {
+        result = raw_ha_response.get("service_response") or raw_ha_response.get("response", {
             "status": "error",
             "data": "Failed to parse the notification payload."
         })
+
+        return json.dumps(result)
 
 
 @local_tool

@@ -13,6 +13,7 @@ setproctitle.setproctitle("Hermes Stream Player")
 
 import signal
 import threading
+import time
 import urllib
 import urllib.request
 import urllib.error
@@ -37,11 +38,35 @@ SAMPLE_FORMAT = np.float32
 
 # Queue Parameters
 START_THRESHOLD = 3 # minimum packets to start playback
+UTTERANCE_GAP_SECONDS = 1.0  # silence required before the next utterance gets a chime
 
 # Pre-allocate a ring buffer of shared memory blocks
 RING_SIZE = 4096  # number of slots
 MASK = RING_SIZE - 1
 BLOCK_BYTES = CHANNELS * FRAMES_PER_PACKET * np.dtype(np.float32).itemsize
+
+
+def make_start_chime() -> np.ndarray:
+    """Create a short, quiet two-note chime for the start of an utterance."""
+    notes = ((880.0, 0.14), (1320.0, 0.20))
+    parts = []
+    for frequency, duration in notes:
+        samples = max(1, int(RATE * duration))
+        t = np.arange(samples, dtype=np.float32) / RATE
+        note = np.sin(2 * np.pi * frequency * t)
+        fade = min(int(RATE * 0.02), samples // 2)
+        envelope = np.ones(samples, dtype=np.float32)
+        if fade:
+            envelope[:fade] = np.linspace(0.0, 1.0, fade, endpoint=False)
+            envelope[-fade:] = np.linspace(1.0, 0.0, fade)
+        parts.append(note * envelope * 0.12)
+
+    chime = np.concatenate(parts)
+    # Pad to whole output blocks so the callback can play the chime without
+    # handling a partial final block.
+    padded_length = ((len(chime) + FRAMES_PER_PACKET - 1) // FRAMES_PER_PACKET) * FRAMES_PER_PACKET
+    chime = np.pad(chime, (0, padded_length - len(chime)))
+    return chime.reshape(-1, CHANNELS).astype(SAMPLE_FORMAT)
 
 
 class BidirectionalEvent:
@@ -243,28 +268,47 @@ if __name__ == '__main__':
     
     played_packets = 0
     SILENCE = np.zeros((FRAMES_PER_PACKET, CHANNELS), dtype=np.float32)
-    def callback(outdata, frames, time, status):
+    START_CHIME = make_start_chime()
+    # The end of the array is the "not playing" sentinel. While a chime is
+    # active, this is the offset of the next samples to send to the device.
+    chime_position = len(START_CHIME)
+    quiet_since: float | None = None
+
+    def callback(outdata, frames, callback_time, status):
         """sounddevice callback: fill each audio block from the shared ring buffer.
 
         The callback runs on the audio thread and is expected to be very fast. It
         checks how many packets are waiting in the ring, starts playback once the
-        buffer has enough data to avoid startup stutter, and emits silence when the
-        receiver is still warming up or the stream has dropped out.
+        buffer has enough data to avoid startup stutter, plays a chime once at the
+        beginning of each utterance, and emits silence when the stream has dropped out.
         """
-        global played_packets, playing
+        global played_packets, playing, chime_position, quiet_since
 
         # Number of packets buffered since the producer pointer outran the consumer.
         available = write_idx.value - read_idx.value
+
+        if chime_position < len(START_CHIME):
+            # Output one callback-sized slice at a time. Network audio remains
+            # buffered while the chime plays, so speech starts afterward.
+            chime_end = min(chime_position + frames, len(START_CHIME))
+            outdata[:] = SILENCE
+            outdata[:chime_end - chime_position] = START_CHIME[chime_position:chime_end]
+            chime_position = chime_end
+            return
+
         if not playing:
             played_packets = 0
             if available >= START_THRESHOLD:
                 playing = True
+                if quiet_since is None or time.monotonic() - quiet_since >= UTTERANCE_GAP_SECONDS:
+                    # A sufficiently long quiet period marks a new utterance.
+                    chime_position = 0
+                    duck_audio.set()
+                    return
                 duck_audio.set()
             else:
-                # A single packet is often enough to keep the stream alive while the
-                # buffer is still filling; once we have enough data, switch to playing.
-                if available == 1:
-                    duck_audio.set()
+                if quiet_since is None:
+                    quiet_since = time.monotonic()
                 outdata[:] = SILENCE
                 return
 
@@ -278,6 +322,7 @@ if __name__ == '__main__':
             # AirPlay volume to avoid a very audible sudden transition.
             outdata[:] = SILENCE
             playing = False
+            quiet_since = time.monotonic()
             duck_audio.clear()
             print(f"Played {played_packets} packets")
 
