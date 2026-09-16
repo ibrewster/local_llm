@@ -583,6 +583,100 @@ async def _stream_tokens(
     elapsed = time.time_ns() - t0
     yield "", True, {"eval_count": eval_count, "eval_duration": elapsed}
 
+
+_THINKING_START_TAGS = ("<think>", "<|channel>")
+_THINKING_END_TAGS = ("</think>", "<channel|>")
+
+
+def _partial_tag_length(text: str, tags: tuple[str, ...]) -> int:
+    """Return the length of a suffix that could be the start of a split tag."""
+    return max(
+        (
+            length
+            for tag in tags
+            for length in range(1, min(len(text), len(tag) - 1) + 1)
+            if tag.startswith(text[-length:])
+        ),
+        default=0,
+    )
+
+
+def _strip_thinking_token(
+    token: str, state: dict[str, Any], *, final: bool = False
+) -> str:
+    """Remove thinking sections from a streamed token.
+
+    The model may emit either ``<think>...</think>`` or the equivalent
+    ``<|channel>...<channel|>`` markers. Since either marker can be split
+    across tokens, ``state`` retains both whether we are inside a thinking
+    section and any suffix that might become a tag when the next token arrives.
+    Text outside thinking sections is returned immediately; thinking text and
+    marker text are discarded. When ``final`` is true, no incomplete buffered
+    marker or thinking section can be emitted.
+    """
+    pending = state.get("pending_thinking_text", "") + token
+    output: list[str] = []
+
+    while pending:
+        if state.get("in_thinking", False):
+            end_matches = [
+                (pending.find(tag), tag)
+                for tag in _THINKING_END_TAGS
+                if pending.find(tag) != -1
+            ]
+            if not end_matches:
+                # There is no complete end tag yet. Keep only a possible
+                # partial tag suffix so it can be completed by the next chunk.
+                if final:
+                    pending = ""
+                else:
+                    keep = _partial_tag_length(pending, _THINKING_END_TAGS)
+                    pending = pending[-keep:] if keep else ""
+                break
+
+            _, tag = min(end_matches)
+            # Drop the thinking section through its closing marker, then
+            # continue processing in case the same token contains the answer.
+            pending = pending[pending.find(tag) + len(tag):]
+            state["in_thinking"] = False
+            continue
+
+        # Outside a thinking section, preserve normal text and consume any
+        # thinking markers that appear before it.
+        tag_matches = [
+            (pending.find(tag), tag)
+            for tag in (*_THINKING_START_TAGS, *_THINKING_END_TAGS)
+            if pending.find(tag) != -1
+        ]
+        if not tag_matches:
+            if final:
+                output.append(pending)
+                pending = ""
+            else:
+                # Delay a possible partial tag; ordinary text can be emitted
+                # immediately, while the suffix waits for the next chunk.
+                keep = _partial_tag_length(
+                    pending, (*_THINKING_START_TAGS, *_THINKING_END_TAGS)
+                )
+                if keep:
+                    output.append(pending[:-keep])
+                    pending = pending[-keep:]
+                else:
+                    output.append(pending)
+                    pending = ""
+            break
+
+        index, tag = min(tag_matches)
+        output.append(pending[:index])
+        pending = pending[index + len(tag):]
+        if tag in _THINKING_START_TAGS:
+            # Everything following this marker is hidden until an end marker.
+            state["in_thinking"] = True
+
+    state["pending_thinking_text"] = pending
+    return "".join(output)
+
+
 async def generate_stream(stream, model_info, msg_history, options,
                           is_gen=False, tools=None, think=False, images=None):
     t1 = time.time_ns()
@@ -620,6 +714,7 @@ async def generate_stream(stream, model_info, msg_history, options,
         buffer = ""
         unicode_buf = ""
         first_token = True
+        thinking_state: dict[str, Any] = {}
 
         try:
             async for token, done, stats in _stream_tokens(
@@ -639,9 +734,12 @@ async def generate_stream(stream, model_info, msg_history, options,
                     if "thought" in token and not "<|channel>" in token:
                         logging.warning("Missing <|channel>! Prepending")
                         token = "<|channel>" + token
-    
+
+                if not think:
+                    token = _strip_thinking_token(token, thinking_state)
+
                 full_text += token
-    
+
                 if tool_call_detected:
                     continue
     
@@ -689,6 +787,9 @@ async def generate_stream(stream, model_info, msg_history, options,
             logging.exception(f"Unable to finish response: {e}")
         except asyncio.exceptions.CancelledError:
             logging.warning(f"Request Canceled")
+
+        if not think:
+            full_text += _strip_thinking_token("", thinking_state, final=True)
 
         logging.info(f"Generated response in {time.time() - t2}")
         logging.info(f"Raw Response: {full_text}")
