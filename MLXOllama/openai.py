@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import re
 import time
 import uuid
 from typing import Any, Mapping, cast
@@ -129,6 +130,13 @@ async def chat_completions() -> Any:
             JsonObject,
             final_chunk.get("message", {"role": "assistant", "content": ""}),
         )
+
+        if not think and message.get("content"):
+            content = message["content"]
+            content = re.sub(r'<\|channel>.*?<channel\|>', '', content, flags=re.DOTALL)
+            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+            content = re.sub(r'<\|?channel\|?>', '', content)
+            message["content"] = content.strip()
 
         if message.get("tool_calls"):
             message["tool_calls"] = _format_tool_calls(message["tool_calls"], for_stream=False)
