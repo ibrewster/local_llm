@@ -1,6 +1,15 @@
 #!/Users/israel/Development/tts_pipeline/llm_env/bin/python -u
+"""Receive multicast audio from the Hermes sender and play it locally.
+
+This script listens for UDP audio packets on a multicast address, stores them in a
+shared ring buffer so the receiver process can decouple socket I/O from the audio
+callback thread, and streams the buffered PCM samples to the local speaker. It also
+optionally ducks AirPlay volume while playback is active so the local speaker output
+remains audible without overwhelming the AirPlay stream.
+"""
+
 import setproctitle
-setproctitle.setproctitle("Hermes Player")
+setproctitle.setproctitle("Hermes Stream Player")
 
 import signal
 import threading
@@ -80,7 +89,17 @@ class BidirectionalEvent:
 
 
 def receiver_process(shm_name, read_idx, write_idx, exit_flag):
-    """Runs in a separate process - owns the socket, no GIL contention with audio"""
+    """Drain the UDP socket directly into the shared ring buffer.
+
+This receiver runs in a dedicated process to eliminate contention with the main
+audio playback loop. On fast networks, contention can delay socket reads just
+long enough for the OS-level receive buffer to overflow—even when configured to
+its maximum size—resulting in dropped packets.
+
+By isolating the socket reader, this process can drain incoming packets into the
+preallocated ring buffer as quickly as they arrive. This prevents socket overruns
+and data loss, while ensuring the playback thread remains responsive.
+    """
     import socket, numpy as np
 
     def _sigterm_handler(signum, frame):
@@ -89,7 +108,7 @@ def receiver_process(shm_name, read_idx, write_idx, exit_flag):
     
     signal.signal(signal.SIGTERM, _sigterm_handler)    
 
-    setproctitle.setproctitle("Hermes Receiver")
+    setproctitle.setproctitle("Hermes Socket Receiver")
     try:
         existing_shm = shm.SharedMemory(name=shm_name, track=False)
     except TypeError:
@@ -135,9 +154,15 @@ def receiver_process(shm_name, read_idx, write_idx, exit_flag):
 
 
 def set_airplay_volume(level):
-    """
-    Sends a PUT request using the Python standard library.
-    level: integer (0-100)
+    """Set the AirPlay device volume to the requested level.
+
+    This is used by the ducker to briefly reduce the AirPlay volume while the local
+    Hermes audio is playing, then restore it afterward. The function uses a direct
+    HTTP PUT instead of a higher-level library so it can stay lightweight and
+    dependency-free.
+
+    Args:
+        level: Integer percentage from 0 to 100.
     """
     url = f"http://10.27.81.2:8181/airplay_devices/{quote(AIRPLAY_ID, safe='')}/volume"
     AIRPLAY_ID
@@ -155,6 +180,14 @@ def set_airplay_volume(level):
     
         
 def audio_ducker(duck_event: BidirectionalEvent):
+    """Lower AirPlay volume while local Hermes audio is active.
+
+    The ducker is a lightweight background thread: it waits for a toggle signal from
+    the playback callback, drops the AirPlay volume for the duration of local audio,
+    and then restores it when the callback indicates the stream has stopped or gone
+    quiet. This keeps the local stream audible without requiring a full audio mixing
+    stack.
+    """
     if AIRPLAY_ID is None:
         print("Not running ducker on this node")
         return # No device to duck.
@@ -175,6 +208,10 @@ def audio_ducker(duck_event: BidirectionalEvent):
     print("Ducker thread exited")
     
 # Main process
+# The application is launched as a standalone listener process: it owns the
+# network socket, the shared memory ring, and the playback stream for the local
+# speaker. Keeping the producer/consumer split explicit makes it easier to reason
+# about startup, buffering, and shutdown timing.
 if __name__ == '__main__':
     exit_flag = mp.Event()
     
@@ -207,8 +244,16 @@ if __name__ == '__main__':
     played_packets = 0
     SILENCE = np.zeros((FRAMES_PER_PACKET, CHANNELS), dtype=np.float32)
     def callback(outdata, frames, time, status):
+        """sounddevice callback: fill each audio block from the shared ring buffer.
+
+        The callback runs on the audio thread and is expected to be very fast. It
+        checks how many packets are waiting in the ring, starts playback once the
+        buffer has enough data to avoid startup stutter, and emits silence when the
+        receiver is still warming up or the stream has dropped out.
+        """
         global played_packets, playing
 
+        # Number of packets buffered since the producer pointer outran the consumer.
         available = write_idx.value - read_idx.value
         if not playing:
             played_packets = 0
@@ -216,6 +261,8 @@ if __name__ == '__main__':
                 playing = True
                 duck_audio.set()
             else:
+                # A single packet is often enough to keep the stream alive while the
+                # buffer is still filling; once we have enough data, switch to playing.
                 if available == 1:
                     duck_audio.set()
                 outdata[:] = SILENCE
@@ -227,6 +274,8 @@ if __name__ == '__main__':
             read_idx.value += 1
             played_packets += 1
         else:
+            # When the network is quiet, stop playback and let the ducker restore the
+            # AirPlay volume to avoid a very audible sudden transition.
             outdata[:] = SILENCE
             playing = False
             duck_audio.clear()

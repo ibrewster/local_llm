@@ -124,9 +124,6 @@ conversation_store = TTLCache(maxsize=100, ttl=3600)
 
 MCP_CLIENT_CONFIG = {
     "mcpServers": {
-        # "MCPAssist": {
-            # "url": "http://10.27.81.207:8090",
-        # },
         "homeassistant": {
             "url": "http://10.27.81.207:8123/api/mcp",
             "headers": {
@@ -137,16 +134,6 @@ MCP_CLIENT_CONFIG = {
             "command": "uvx",
             "args": ["mcp-server-fetch"]
         },
-        # "searxng-http": {
-            # "url": "http://10.27.81.60:3003/mcp",
-            # "env": {
-                # "SEARXNG_URL": "http://10.27.81.60:3002/search",
-                # "MCP_HTTP_PORT": "3003"
-            # }
-        # },
-        # "tavily": {
-        #     "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={config.TAVILY_TOKEN}",
-        # },
     }
 }
 

@@ -7,7 +7,6 @@ import time
 
 from datetime import datetime, timedelta, date
 from enum import Enum
-from pathlib import Path
 from typing import (
     Any,
     Annotated,
@@ -27,7 +26,7 @@ import pytz
 
 from rapidfuzz import process, fuzz, utils
 
-from . import cache_utils
+from . import cache_utils, config
 from .async_ttl_cache import async_ttl_cache
 from .config import BRAVE_SEARCH_API_KEY
 
@@ -359,6 +358,49 @@ async def get_current_time(timezone: str | None = None) -> str:
 
     # Most readable format for agents & humans
     return now.strftime("%Y-%m-%d %-I:%M:%S %p %Z")
+
+@local_tool
+async def get_notifications() -> dict[str, Any]:
+    """Retrieves unread smart home notifications, alerts, or messages. Use this tool whenever the user asks for their notifications, alerts, or messages (e.g., "What are my notifications?", "Read my messages", "Do I have any alerts?").
+
+    CRITICAL: The returned text in the 'data' field already has a specific theatrical persona applied. You MUST output this exact 'data' string to the user verbatim without summarizing, adding introductory text, or applying any additional personality.
+
+    PARAMETERS
+    ----------
+    None.
+
+    RETURNS
+    -------
+    dict: A dictionary containing the notification status and pre-formatted text payload.
+    """
+
+    # Secrets and config are handled by the host environment, completely hidden from the LLM
+    ha_base_url = config.HA_URL
+    access_token = config.HA_TOKEN
+
+    endpoint = f"{ha_base_url.rstrip('/')}/api/services/script/read_and_clear_notifications?return_response=true"
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            endpoint,
+            headers=headers,
+            json={}
+        )
+        response.raise_for_status()
+
+        # Depending on your HA setup, you may need to extract the exact nested path
+        # from the HA API response to match the clean schema returned to the LLM.
+        raw_ha_response = response.json()
+
+        return raw_ha_response.get("service_response") or raw_ha_response.get("response", {
+            "status": "error",
+            "data": "Failed to parse the notification payload."
+        })
 
 
 @local_tool
