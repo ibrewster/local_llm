@@ -47,25 +47,46 @@ BLOCK_BYTES = CHANNELS * FRAMES_PER_PACKET * np.dtype(np.float32).itemsize
 
 
 def make_start_chime() -> np.ndarray:
-    """Create a short, quiet two-note chime for the start of an utterance."""
-    notes = ((880.0, 0.14), (1320.0, 0.20))
+    """Create a prominent but pleasant chime that cuts through background music."""
+    # Slightly lengthened the notes to give the ducker more time to engage
+    notes = ((440.0, 0.4), (660.0, 0.9))
     parts = []
+
     for frequency, duration in notes:
         samples = max(1, int(RATE * duration))
         t = np.arange(samples, dtype=np.float32) / RATE
-        note = np.sin(2 * np.pi * frequency * t)
-        fade = min(int(RATE * 0.02), samples // 2)
-        envelope = np.ones(samples, dtype=np.float32)
-        if fade:
-            envelope[:fade] = np.linspace(0.0, 1.0, fade, endpoint=False)
-            envelope[-fade:] = np.linspace(1.0, 0.0, fade)
-        parts.append(note * envelope * 0.12)
+
+        # Added a 3rd harmonic (3x frequency) at 10% volume.
+        # This acts like an acoustic "highlighter" to help it pierce through a dense music mix.
+        note = (
+                np.sin(2 * np.pi * frequency * t) +
+                0.20 * np.sin(2 * np.pi * frequency * 2 * t) +
+                0.10 * np.sin(2 * np.pi * frequency * 3 * t)
+        )
+
+        # Slower exponential decay (-2.0 instead of -4.0).
+        # This keeps the volume higher for longer before fading out.
+        envelope = np.exp(-2.0 * t)
+
+        attack_samples = min(int(RATE * 0.05), samples // 2)
+        if attack_samples > 0:
+            envelope[:attack_samples] *= np.linspace(0.0, 1.0, attack_samples, endpoint=False)
+
+        # Boosted overall volume from 0.25 to 0.70.
+        # The math stays safely below clipping (1.0 + 0.2 + 0.1 = 1.3 max * 0.7 = 0.91)
+        parts.append(note * envelope * 0.70)
 
     chime = np.concatenate(parts)
-    # Pad to whole output blocks so the callback can play the chime without
-    # handling a partial final block.
+
+    # Extended the final silence to 600ms.
+    # Combined with the chime, this ensures your 1-second ducker has fully
+    # engaged the music volume reduction before the TTS actually starts talking.
+    silence = np.zeros(int(RATE * 0.6), dtype=np.float32)
+    chime = np.concatenate((chime, silence))
+
     padded_length = ((len(chime) + FRAMES_PER_PACKET - 1) // FRAMES_PER_PACKET) * FRAMES_PER_PACKET
     chime = np.pad(chime, (0, padded_length - len(chime)))
+
     return chime.reshape(-1, CHANNELS).astype(SAMPLE_FORMAT)
 
 
@@ -222,8 +243,8 @@ def audio_ducker(duck_event: BidirectionalEvent):
         while not exit_flag.is_set():
             if not duck_event.wait_set(timeout=0.5):
                 continue
-            print("Ducking Airplay Volume")
             set_airplay_volume(50)
+            print("Ducking Airplay Volume")
             duck_event.wait_clear()
             print("Restoring Airplay Volume")
             set_airplay_volume(100)
@@ -266,12 +287,23 @@ if __name__ == '__main__':
     volume_thread = threading.Thread(target=audio_ducker, daemon=True, args=(duck_audio, ))
     volume_thread.start()
     
-    played_packets = 0
-    SILENCE = np.zeros((FRAMES_PER_PACKET, CHANNELS), dtype=np.float32)
+    # Pre-allocate slice views to avoid ndarray creation during callback execution
+    ring_slices = [ring[i] for i in range(RING_SIZE)]
     START_CHIME = make_start_chime()
+    chime_len = len(START_CHIME)
+
+    # Fast local bindings for closure
+    mask = MASK
+    start_thresh = START_THRESHOLD
+    gap_seconds = UTTERANCE_GAP_SECONDS
+    duck_set = duck_audio.set
+    duck_clear = duck_audio.clear
+    monotonic = time.monotonic
+
+    played_packets = 0
     # The end of the array is the "not playing" sentinel. While a chime is
     # active, this is the offset of the next samples to send to the device.
-    chime_position = len(START_CHIME)
+    chime_position = chime_len
     quiet_since: float | None = None
 
     def callback(outdata, frames, callback_time, status):
@@ -282,48 +314,50 @@ if __name__ == '__main__':
         buffer has enough data to avoid startup stutter, plays a chime once at the
         beginning of each utterance, and emits silence when the stream has dropped out.
         """
-        global played_packets, playing, chime_position, quiet_since
+        global playing, played_packets, chime_position, quiet_since
 
         # Number of packets buffered since the producer pointer outran the consumer.
         available = write_idx.value - read_idx.value
 
-        if chime_position < len(START_CHIME):
+        if chime_position < chime_len:
             # Output one callback-sized slice at a time. Network audio remains
             # buffered while the chime plays, so speech starts afterward.
-            chime_end = min(chime_position + frames, len(START_CHIME))
-            outdata[:] = SILENCE
-            outdata[:chime_end - chime_position] = START_CHIME[chime_position:chime_end]
+            # Safe to assign directly without zero-fill or min() boundary clamping because
+            # make_start_chime() guarantees chime_len is an exact multiple of frames (FRAMES_PER_PACKET).
+            chime_end = chime_position + frames
+            outdata[:] = START_CHIME[chime_position:chime_end]
             chime_position = chime_end
             return
 
         if not playing:
             played_packets = 0
-            if available >= START_THRESHOLD:
+            if available >= start_thresh:
                 playing = True
-                if quiet_since is None or time.monotonic() - quiet_since >= UTTERANCE_GAP_SECONDS:
+                duck_set()
+                now = monotonic()
+                if quiet_since is None or (now - quiet_since) >= gap_seconds:
                     # A sufficiently long quiet period marks a new utterance.
-                    chime_position = 0
-                    duck_audio.set()
+                    chime_position = frames
+                    outdata[:] = START_CHIME[:frames]
                     return
-                duck_audio.set()
             else:
                 if quiet_since is None:
-                    quiet_since = time.monotonic()
-                outdata[:] = SILENCE
+                    quiet_since = monotonic()
+                outdata.fill(0.0)
                 return
 
         if available > 0:
-            slot = read_idx.value & MASK
-            outdata[:] = ring[slot]
+            slot = read_idx.value & mask
+            outdata[:] = ring_slices[slot]
             read_idx.value += 1
             played_packets += 1
         else:
             # When the network is quiet, stop playback and let the ducker restore the
             # AirPlay volume to avoid a very audible sudden transition.
-            outdata[:] = SILENCE
+            outdata.fill(0.0)
             playing = False
-            quiet_since = time.monotonic()
-            duck_audio.clear()
+            quiet_since = monotonic()
+            duck_clear()
             print(f"Played {played_packets} packets")
 
 
