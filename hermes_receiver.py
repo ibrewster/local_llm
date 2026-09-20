@@ -7,25 +7,21 @@ callback thread, and streams the buffered PCM samples to the local speaker. It a
 optionally ducks AirPlay volume while playback is active so the local speaker output
 remains audible without overwhelming the AirPlay stream.
 """
+import array
 import json
-
-import setproctitle
-setproctitle.setproctitle("Hermes Stream Player")
-
+import math
+import multiprocessing as mp
+import multiprocessing.shared_memory as shm
 import signal
 import threading
 import time
 import urllib
-import urllib.request
 import urllib.error
-
+import urllib.request
 from urllib.parse import quote
 
-import multiprocessing as mp
-import multiprocessing.shared_memory as shm
+import setproctitle
 import sounddevice as sd
-
-import numpy as np
 
 from receiver_config import AIRPLAY_ID, CLIENT_ID
 
@@ -35,7 +31,7 @@ PORT = 5005
 CHANNELS = 1
 RATE = 24000
 FRAMES_PER_PACKET = 1024  # must match sender
-SAMPLE_FORMAT = np.float32
+SAMPLE_FORMAT = 'float32'
 
 # Queue Parameters
 START_THRESHOLD = 3 # minimum packets to start playback
@@ -44,51 +40,52 @@ UTTERANCE_GAP_SECONDS = 1.0  # silence required before the next utterance gets a
 # Pre-allocate a ring buffer of shared memory blocks
 RING_SIZE = 4096  # number of slots
 MASK = RING_SIZE - 1
-BLOCK_BYTES = CHANNELS * FRAMES_PER_PACKET * np.dtype(np.float32).itemsize
+BLOCK_BYTES = CHANNELS * FRAMES_PER_PACKET * 4  # 4 bytes per float32 sample
 
 
-def make_start_chime() -> np.ndarray:
+def make_start_chime() -> bytes:
     """Create a prominent but pleasant chime that cuts through background music."""
     # Slightly lengthened the notes to give the ducker more time to engage
     notes = ((440.0, 0.4), (660.0, 0.9))
-    parts = []
+    samples_list = array.array('f')
 
     for frequency, duration in notes:
-        samples = max(1, int(RATE * duration))
-        t = np.arange(samples, dtype=np.float32) / RATE
+        samples_count = max(1, int(RATE * duration))
+        attack_samples = min(int(RATE * 0.05), samples_count // 2)
+        two_pi_f = 2.0 * math.pi * frequency
 
-        # Added a 3rd harmonic (3x frequency) at 10% volume.
-        # This acts like an acoustic "highlighter" to help it pierce through a dense music mix.
-        note = (
-                np.sin(2 * np.pi * frequency * t) +
-                0.20 * np.sin(2 * np.pi * frequency * 2 * t) +
-                0.10 * np.sin(2 * np.pi * frequency * 3 * t)
-        )
+        for i in range(samples_count):
+            t = i / RATE
+            # Added a 3rd harmonic (3x frequency) at 10% volume.
+            # This acts like an acoustic "highlighter" to help it pierce through a dense music mix.
+            note = (
+                math.sin(two_pi_f * t) +
+                0.20 * math.sin(2.0 * two_pi_f * t) +
+                0.10 * math.sin(3.0 * two_pi_f * t)
+            )
 
-        # Slower exponential decay (-2.0 instead of -4.0).
-        # This keeps the volume higher for longer before fading out.
-        envelope = np.exp(-2.0 * t)
+            # Slower exponential decay (-2.0 instead of -4.0).
+            # This keeps the volume higher for longer before fading out.
+            envelope = math.exp(-2.0 * t)
 
-        attack_samples = min(int(RATE * 0.05), samples // 2)
-        if attack_samples > 0:
-            envelope[:attack_samples] *= np.linspace(0.0, 1.0, attack_samples, endpoint=False)
+            if attack_samples > 0 and i < attack_samples:
+                envelope *= (i / attack_samples)
 
-        # Boosted overall volume from 0.25 to 0.70.
-        # The math stays safely below clipping (1.0 + 0.2 + 0.1 = 1.3 max * 0.7 = 0.91)
-        parts.append(note * envelope * 0.70)
-
-    chime = np.concatenate(parts)
+            # Boosted overall volume from 0.25 to 0.70.
+            # The math stays safely below clipping (1.0 + 0.2 + 0.1 = 1.3 max * 0.7 = 0.91)
+            samples_list.append(note * envelope * 0.70)
 
     # Extended the final silence to 600ms.
     # Combined with the chime, this ensures your 1-second ducker has fully
     # engaged the music volume reduction before the TTS actually starts talking.
-    silence = np.zeros(int(RATE * 0.6), dtype=np.float32)
-    chime = np.concatenate((chime, silence))
+    silence_count = int(RATE * 0.6)
+    samples_list.extend([0.0] * silence_count)
 
-    padded_length = ((len(chime) + FRAMES_PER_PACKET - 1) // FRAMES_PER_PACKET) * FRAMES_PER_PACKET
-    chime = np.pad(chime, (0, padded_length - len(chime)))
+    rem = len(samples_list) % FRAMES_PER_PACKET
+    if rem != 0:
+        samples_list.extend([0.0] * (FRAMES_PER_PACKET - rem))
 
-    return chime.reshape(-1, CHANNELS).astype(SAMPLE_FORMAT)
+    return samples_list.tobytes()
 
 
 class BidirectionalEvent:
@@ -147,7 +144,7 @@ By isolating the socket reader, this process can drain incoming packets into the
 preallocated ring buffer as quickly as they arrive. This prevents socket overruns
 and data loss, while ensuring the playback thread remains responsive.
     """
-    import socket, numpy as np
+    import socket
 
     def _sigterm_handler(signum, frame):
         print("Signal handler in RECEIVER called")
@@ -162,8 +159,8 @@ and data loss, while ensuring the playback thread remains responsive.
         # Python < 3.13
         existing_shm = shm.SharedMemory(name=shm_name)
     
-    ring = np.ndarray((RING_SIZE, FRAMES_PER_PACKET, CHANNELS), 
-                      dtype=np.float32, buffer=existing_shm.buf)
+    buf = existing_shm.buf
+    ring_views = [buf[i * BLOCK_BYTES : (i + 1) * BLOCK_BYTES] for i in range(RING_SIZE)]
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -174,8 +171,6 @@ and data loss, while ensuring the playback thread remains responsive.
     mreq = socket.inet_aton(IP) + socket.inet_aton('0.0.0.0')
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
     sock.settimeout(0.5)
-    
-    ring_views = [memoryview(ring[i]) for i in range(RING_SIZE)]
 
     try:
         while not exit_flag.is_set():
@@ -193,11 +188,16 @@ and data loss, while ensuring the playback thread remains responsive.
     except KeyboardInterrupt:
         print("Received Keyboard Inerrupt. Exiting.")
         exit_flag.set()
-        
-    print("Exiting Receiver Process")
-    existing_shm.close()
-    sock.close()
-    print("Receiver process complete")
+    finally:
+        print("Exiting Receiver Process")
+        for view in ring_views:
+            view.release()
+        del ring_views
+        buf.release()
+        del buf
+        existing_shm.close()
+        sock.close()
+        print("Receiver process complete")
 
 
 def set_airplay_volume(level):
@@ -301,8 +301,6 @@ if __name__ == '__main__':
     read_idx = mp.Value('Q', 0, lock=False)  
     
     ring_shm = shm.SharedMemory(create=True, size=RING_SIZE * BLOCK_BYTES)
-    ring = np.ndarray((RING_SIZE, FRAMES_PER_PACKET, CHANNELS), 
-                      dtype=np.float32, buffer=ring_shm.buf)
 
     proc = mp.Process(
         target=receiver_process,
@@ -317,8 +315,10 @@ if __name__ == '__main__':
     volume_thread = threading.Thread(target=audio_ducker, daemon=True, args=(duck_audio, ))
     volume_thread.start()
     
-    # Pre-allocate slice views to avoid ndarray creation during callback execution
-    ring_slices = [ring[i] for i in range(RING_SIZE)]
+    # Pre-allocate slice views to avoid memory allocations during callback execution
+    buf = ring_shm.buf
+    ring_slices = [buf[i * BLOCK_BYTES : (i + 1) * BLOCK_BYTES] for i in range(RING_SIZE)]
+    SILENCE = b'\x00' * BLOCK_BYTES
     START_CHIME = make_start_chime()
     chime_len = len(START_CHIME)
 
@@ -329,6 +329,7 @@ if __name__ == '__main__':
     duck_set = duck_audio.set
     duck_clear = duck_audio.clear
     monotonic = time.monotonic
+    block_bytes = BLOCK_BYTES
 
     played_packets = 0
     # The end of the array is the "not playing" sentinel. While a chime is
@@ -354,7 +355,7 @@ if __name__ == '__main__':
             # buffered while the chime plays, so speech starts afterward.
             # Safe to assign directly without zero-fill or min() boundary clamping because
             # make_start_chime() guarantees chime_len is an exact multiple of frames (FRAMES_PER_PACKET).
-            chime_end = chime_position + frames
+            chime_end = chime_position + block_bytes
             outdata[:] = START_CHIME[chime_position:chime_end]
             chime_position = chime_end
             return
@@ -367,13 +368,13 @@ if __name__ == '__main__':
                 now = monotonic()
                 if quiet_since is None or (now - quiet_since) >= gap_seconds:
                     # A sufficiently long quiet period marks a new utterance.
-                    chime_position = frames
-                    outdata[:] = START_CHIME[:frames]
+                    chime_position = block_bytes
+                    outdata[:] = START_CHIME[:block_bytes]
                     return
             else:
                 if quiet_since is None:
                     quiet_since = monotonic()
-                outdata.fill(0.0)
+                outdata[:] = SILENCE
                 return
 
         if available > 0:
@@ -384,7 +385,7 @@ if __name__ == '__main__':
         else:
             # When the network is quiet, stop playback and let the ducker restore the
             # AirPlay volume to avoid a very audible sudden transition.
-            outdata.fill(0.0)
+            outdata[:] = SILENCE
             playing = False
             quiet_since = monotonic()
             duck_clear()
@@ -392,14 +393,14 @@ if __name__ == '__main__':
 
 
     # Sounddevice output stream
-    with sd.OutputStream(
+    with sd.RawOutputStream(
         samplerate=RATE,
-            blocksize=FRAMES_PER_PACKET,
-            channels=CHANNELS,
-            dtype=SAMPLE_FORMAT,
-            callback=callback,
-            latency='low'
-            ):
+        blocksize=FRAMES_PER_PACKET,
+        channels=CHANNELS,
+        dtype=SAMPLE_FORMAT,
+        callback=callback,
+        latency='low'
+    ):
         print("Listening for UDP audio...")
         try:
             exit_flag.wait()  # Blocks forever, zero CPU
@@ -418,6 +419,12 @@ if __name__ == '__main__':
         
     if volume_thread.is_alive():
         duck_audio.clear()
+
+    for sl in ring_slices:
+        sl.release()
+    del ring_slices
+    buf.release()
+    del buf
         
     ring_shm.close()
     ring_shm.unlink()
