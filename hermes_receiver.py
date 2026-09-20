@@ -7,6 +7,7 @@ callback thread, and streams the buffered PCM samples to the local speaker. It a
 optionally ducks AirPlay volume while playback is active so the local speaker output
 remains audible without overwhelming the AirPlay stream.
 """
+import json
 
 import setproctitle
 setproctitle.setproctitle("Hermes Stream Player")
@@ -26,7 +27,7 @@ import sounddevice as sd
 
 import numpy as np
 
-from receiver_config import AIRPLAY_ID
+from receiver_config import AIRPLAY_ID, CLIENT_ID
 
 # Audio parameters (match sender)
 IP = "239.0.0.1"
@@ -210,8 +211,10 @@ def set_airplay_volume(level):
     Args:
         level: Integer percentage from 0 to 100.
     """
+    if AIRPLAY_ID is None:
+        return False
+
     url = f"http://10.27.81.2:8181/airplay_devices/{quote(AIRPLAY_ID, safe='')}/volume"
-    AIRPLAY_ID
     payload_bytes = urllib.parse.urlencode({"level": level}).encode('utf-8')
     
     req = urllib.request.Request(url, data=payload_bytes, method='PUT')
@@ -223,8 +226,37 @@ def set_airplay_volume(level):
     except (urllib.error.URLError, TimeoutError) as e:
         print(f"Volume ducking failed: {e}")
         return False
-    
-        
+
+def signal_ha(is_playing: bool):
+    """Send a signal to Home Assistant to indicate the local Hermes audio state.
+
+    This is used by the ducker to notify Home Assistant when the local audio is
+    active or has stopped. The function uses a direct HTTP POST instead of a
+    higher-level library so it can stay lightweight and dependency-free.
+
+    Args:
+        is_playing: Boolean indicating whether the local audio is playing.
+    """
+    if CLIENT_ID is None:
+        return
+
+    HA_URL = "http://10.27.81.207:8123/api/webhook/remote_audio_status"
+
+    payload = {
+        "client_id": CLIENT_ID,
+        "state": "playing" if is_playing else "stopped"
+    }
+    req = urllib.request.Request(
+        HA_URL,
+        data=json.dumps(payload).encode('utf-8'),
+        headers={'Content-Type': 'application/json'}
+    )
+
+    try:
+        urllib.request.urlopen(req, timeout=2)
+    except (urllib.error.URLError, TimeoutError) as e:
+        print(f"Failed to signal Home Assistant: {e}")
+
 def audio_ducker(duck_event: BidirectionalEvent):
     """Lower AirPlay volume while local Hermes audio is active.
 
@@ -234,20 +266,18 @@ def audio_ducker(duck_event: BidirectionalEvent):
     quiet. This keeps the local stream audible without requiring a full audio mixing
     stack.
     """
-    if AIRPLAY_ID is None:
-        print("Not running ducker on this node")
-        return # No device to duck.
-    
     print("Ducker Started")
     try:
         while not exit_flag.is_set():
             if not duck_event.wait_set(timeout=0.5):
                 continue
             set_airplay_volume(50)
+            signal_ha(True)
             print("Ducking Airplay Volume")
             duck_event.wait_clear()
             print("Restoring Airplay Volume")
             set_airplay_volume(100)
+            signal_ha(False)
     except KeyboardInterrupt:
         pass
     
