@@ -485,7 +485,8 @@ async def _stream_tokens(
     options: dict, state: dict|None=None,
     tools: list|None = None,
     think: bool = False,
-    images: list | None = None
+    images: list | None = None,
+    priority: bool = False
 ):
     """
     Yields (token_str, is_done, stats) tuples.
@@ -548,7 +549,8 @@ async def _stream_tokens(
                 opts,
                 sampler=sampler,
                 max_tokens=safe_max,
-                loop=loop)
+                loop=loop,
+                priority=priority)
         )
         state['future'] = future
 
@@ -721,10 +723,13 @@ async def generate_stream(stream, model_info, msg_history, options,
         first_token = True
         thinking_state: dict[str, Any] = {}
 
+        # Detect Home Assistant requests for priority queuing
+        is_ha = cache_utils.HA_MARKER in message_text(msg_history[0].get("content", ""))
+
         try:
             async for token, done, stats in _stream_tokens(
                 model_info, msg_history, options, iteration_state, tools=tools, think=think,
-                images=images
+                images=images, priority=is_ha
             ):
                 if unicode_buf or '\\' in token:
                     unicode_buf += token
