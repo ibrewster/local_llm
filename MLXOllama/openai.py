@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import json
+import logging
+import random
 import time
 import uuid
 from typing import Any, Mapping, cast
@@ -9,6 +11,8 @@ import quart
 
 from . import app, config, utils, worker
 from .common import images_from_messages, read_chat_request
+
+logger = logging.getLogger(__name__)
 
 assert app is not None # because the app wouldn't be running if it was
 JsonObject = dict[str, Any]
@@ -111,7 +115,11 @@ async def chat_completions() -> Any:
     max_depth=4
     depth=utils.inference_worker.pending_count()
     if depth >= max_depth:
-        wait=20 # Generally enough time for a worker to finish and free up a slot in the queue
+        # Use a base wait of 30s plus random jitter of up to 30s so that
+        # flooded simultaneous requests spread out their retries and don't
+        # all hammer the queue again at the same time.
+        wait = 30 + int(random.uniform(0, 30))
+        logger.warning(f"Rejecting request: inference queue full ({depth}/{max_depth}), retry-after {wait}s")
         return _error(
              f"Queue full ({depth}/{max_depth}); retry in {wait}s.",
             503,
