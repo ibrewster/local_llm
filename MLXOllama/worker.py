@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import copy
 import datetime
 import json
@@ -147,7 +148,7 @@ POEM_STYLE = {style_pick}
         top_p=0.92
     )
 
-    token_queue: queue.Queue = cast(queue.Queue, submit_inference_job(message, sampler=sampler))
+    token_queue, _ = submit_inference_job(message, sampler=sampler, priority=True)
     
     remainder = ""
     body_sentences = []
@@ -195,9 +196,6 @@ def speak_thread(speak_queue):
     logging.info("Listening for prompts")
 
     while True:
-        # mx.clear_cache()
-        # gc.collect()
-        # mx.clear_cache()
         try:
             try:
                 msg = speak_queue.get(timeout=300) # 5 minutes
@@ -238,14 +236,13 @@ def speak_thread(speak_queue):
 
             try:
                 buffer = ""
-                token_queue: queue.Queue = cast(
-                    queue.Queue,
-                    submit_inference_job( # Submits to another, dedicated, inference thread
-                        message,
-                        thinking=use_thinking,
-                        sampler=utils.FUN_SAMPLER,
-                        max_kv_size=2048,
-                        max_tokens=4096)
+                token_queue, _ = submit_inference_job( # Submits to another, dedicated, inference thread
+                    message,
+                    thinking=use_thinking,
+                    sampler=utils.FUN_SAMPLER,
+                    max_kv_size=2048,
+                    max_tokens=4096,
+                    priority=True
                 )
 
                 is_thinking = False
@@ -358,8 +355,9 @@ def submit_inference(
     sampler=None,
     max_kv_size=None,
         max_tokens:int = 256, # Default from mlx-vlm
-    loop: asyncio.AbstractEventLoop | None = None    
-) -> queue.Queue | asyncio.Queue:
+    loop: asyncio.AbstractEventLoop | None = None,
+    priority: bool = False
+) -> tuple[queue.Queue | asyncio.Queue, concurrent.futures.Future]:
     
     token_queue = asyncio.Queue() if loop else queue.Queue()
         
@@ -410,8 +408,8 @@ def submit_inference(
             )
             put((None, None, True, e))
 
-    inference_worker.submit(thread_worker)
-    return token_queue
+    future = inference_worker.submit(thread_worker, priority=priority)
+    return token_queue, future
 
 def submit_inference_job(
     message: list,
@@ -421,15 +419,17 @@ def submit_inference_job(
     sampler=None,
     max_kv_size=None,
     max_tokens:int=256, # Default from mlx-vlm
-    loop: asyncio.AbstractEventLoop | None = None
-) -> queue.Queue | asyncio.Queue:
+    loop: asyncio.AbstractEventLoop | None = None,
+    priority:bool = False
+) -> tuple[queue.Queue | asyncio.Queue, concurrent.futures.Future]:
     opts = asyncio.run(setup_inference(message, tools=tools, thinking=thinking))
     return submit_inference(
         opts,
         sampler=sampler,
         max_kv_size=max_kv_size,
         max_tokens=max_tokens,
-        loop=loop
+        loop=loop,
+        priority=priority
     )
 
 def run_dummy_inference():
@@ -542,14 +542,15 @@ async def _stream_tokens(
         full_output_tokens = []
         
         loop = asyncio.get_running_loop()
-        token_queue: asyncio.Queue = cast(
-            asyncio.Queue,
+        token_queue, future = cast(
+            tuple[asyncio.Queue, concurrent.futures.Future],
             submit_inference(
                 opts,
                 sampler=sampler,
                 max_tokens=safe_max,
                 loop=loop)
         )
+        state['future'] = future
 
         while True:
             result = await token_queue.get()
@@ -678,8 +679,12 @@ def _strip_thinking_token(
 
 
 async def generate_stream(stream, model_info, msg_history, options,
-                          is_gen=False, tools=None, think=False, images=None):
+                          is_gen=False, tools=None, think=False, images=None,
+                          state: dict | None = None):
     t1 = time.time_ns()
+    # Ensure state is always a dict; if caller passed None, create one internally
+    if state is None:
+        state = {}
 
     for msg in msg_history:
         if not "content" in msg:
@@ -709,7 +714,7 @@ async def generate_stream(stream, model_info, msg_history, options,
         t2 = time.time()
         full_text = ""
         stats = {}
-        state = {}
+        iteration_state = state if iteration == 0 else {}
         tool_call_detected = False
         buffer = ""
         unicode_buf = ""
@@ -718,7 +723,7 @@ async def generate_stream(stream, model_info, msg_history, options,
 
         try:
             async for token, done, stats in _stream_tokens(
-                model_info, msg_history, options, state, tools=tools, think=think,
+                model_info, msg_history, options, iteration_state, tools=tools, think=think,
                 images=images
             ):
                 if unicode_buf or '\\' in token:
@@ -876,12 +881,12 @@ async def generate_stream(stream, model_info, msg_history, options,
         assistant_resp = {"role": "assistant", "content": full_text}
     if is_gen:
         msg_history.append(assistant_resp)
-        new_key = hash(tuple(state['context']))
+        new_key = hash(tuple(state.get('context', [])))
         utils.conversation_store[new_key] = msg_history
         if stream:
             yield json.dumps({"response": "", **stats_fields}) + "\n"
         else:
-            yield json.dumps({"response": full_text, "context": state['context'], **stats_fields}) + "\n"
+            yield json.dumps({"response": full_text, "context": state.get('context', []), **stats_fields}) + "\n"
     else:
         if stream:
             yield json.dumps({"message": {"role": "assistant", "content": ""}, **stats_fields}) + "\n"

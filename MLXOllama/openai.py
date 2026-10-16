@@ -18,8 +18,12 @@ def _error(
     message: str,
     status: int = 400,
     error_type: str = "invalid_request_error",
+    retry_after: int | None = None
 ) -> tuple[Any, int]:
-    return quart.jsonify({"error": {"message": message, "type": error_type}}), status
+    response = quart.jsonify({"error": {"message": message, "type": error_type}})
+    if retry_after is not None:
+        response.headers["Retry-After"] = str(retry_after)
+    return response, status
 
 
 def _options(data: Mapping[str, Any]) -> JsonObject:
@@ -103,6 +107,18 @@ async def chat_completions() -> Any:
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         return _error(str(exc))
 
+    # Reject if the inference queue is full
+    max_depth=4
+    depth=utils.inference_worker.pending_count()
+    if depth >= max_depth:
+        wait=20 # Generally enough time for a worker to finish and free up a slot in the queue
+        return _error(
+             f"Queue full ({depth}/{max_depth}); retry in {wait}s.",
+            503,
+            "server_error",
+            retry_after=wait
+        )
+
     model_name = data.get("model", config.QUICK_MODEL)
     raw_model_info = utils.loaded_models.get(model_name)
     if raw_model_info is None:
@@ -160,14 +176,54 @@ async def chat_completions() -> Any:
         return quart.jsonify(completion)
 
     async def completion_stream():
+        state = {}
         first = True
-        async for chunk_json in worker.generate_stream(
-            True, model_info, messages, options, tools=tools, think=think, images=images
-        ):
-            chunk = cast(JsonObject, json.loads(chunk_json))
+        generator = worker.generate_stream(
+            True, model_info, messages, options, tools=tools, think=think, images=images,
+            state=state
+        )
+
+        # Send SSE keep-alive comments while waiting for the first token.
+        # Once real data starts flowing, keep-alives are no longer needed.
+        keep_alive_interval = 15  # seconds
+
+        # Use asyncio.shield to protect the generator from cancellation when
+        # wait_for times out. The shield prevents CancelledError from reaching
+        # the generator, so it keeps running while we send keep-alives.
+        next_task = asyncio.ensure_future(generator.__anext__())
+
+        try:
+            # Send an immediate keep-alive so the client gets a response right away.
+            # If the generator is fast, this is just one harmless extra SSE comment frame.
+            yield ":\n\n"
+
+            # Wait for the first chunk, sending more keep-alives if it takes a while
+            first_chunk_json: str | None = None
+            while first_chunk_json is None:
+                try:
+                    first_chunk_json = await asyncio.wait_for(
+                        asyncio.shield(next_task), timeout=keep_alive_interval
+                    )
+                except asyncio.TimeoutError:
+                    yield ":\n\n"  # SSE comment — keeps connection alive
+
+            # First chunk arrived — process it and the rest normally
+            assert first_chunk_json is not None
+            chunk = cast(JsonObject, json.loads(first_chunk_json))
             yield f"data: {json.dumps(_chunk(chunk, model_info['name'], request_id, created, first))}\n\n"
             first = False
-        yield "data: [DONE]\n\n"
+
+            async for chunk_json in generator:
+                chunk = cast(JsonObject, json.loads(chunk_json))
+                yield f"data: {json.dumps(_chunk(chunk, model_info['name'], request_id, created, first))}\n\n"
+
+            yield "data: [DONE]\n\n"
+        except asyncio.CancelledError:
+            # Client disconnected — cancel the queued inference task if it hasn't started yet
+            future: asyncio.Future | None = state.get('future')
+            if future is not None:
+                future.cancel()
+            raise
 
     response = quart.Response(completion_stream(), mimetype="text/event-stream")
     response.timeout = None

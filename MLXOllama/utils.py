@@ -3,7 +3,6 @@ import gc
 import hashlib
 import json
 import logging
-import queue
 import re
 import threading
 import uuid
@@ -25,6 +24,7 @@ from mlx_vlm.utils import load_config
 from sentence_transformers import SentenceTransformer
 
 from . import config, mcp_client
+from .preemptive_queue import PreemptiveQueue
 
 ##### GLOBAL OBJECTS#######
 EMBED_MODEL_NAME = 'all-MiniLM-L6-v2'
@@ -44,7 +44,7 @@ class InferenceWorker:
     _STOP = object()
     
     def __init__(self, name="Hermes_Thinker"):
-        self.tasks = queue.Queue()
+        self.tasks = PreemptiveQueue()
         self.shutdown_flag = False
         
         self.thread = threading.Thread(
@@ -54,12 +54,15 @@ class InferenceWorker:
         )
         self.thread.start()
 
-    def submit(self, fn, *args, **kwargs):
+    def submit(self, fn, *args, priority=False, **kwargs):
         if self.shutdown_flag:
             raise RuntimeError("Worker has been shut down")
         
         future = Future()
-        self.tasks.put((future, fn, args, kwargs))
+        if priority:
+            self.tasks.put_front((future, fn, args, kwargs))
+        else:
+            self.tasks.put((future, fn, args, kwargs))
         return future
     
     def shutdown(self, wait=True):
@@ -68,7 +71,14 @@ class InferenceWorker:
             self.tasks.put(self._STOP)
 
         if wait:
-            self.thread.join()    
+            self.thread.join()
+
+    def pending_count(self):
+        """Queued tasks that haven't been canceled (excludes the running task)."""
+        return sum(
+            1 for item in self.tasks.snapshot()
+            if item is not self._STOP and not item[0].cancelled()
+        )
 
     def _run(self):
         while True:
@@ -86,11 +96,6 @@ class InferenceWorker:
                     future.set_exception(e)
                 else:
                     future.set_result(result)
-                # finally:
-                    # TODO: figure out if this is overkill/hurting performance
-                    # mx.clear_cache()
-                    # gc.collect()
-                    # mx.clear_cache()                
 
 inference_worker = InferenceWorker(name="Hermes_Thinker")
 

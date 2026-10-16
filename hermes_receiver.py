@@ -4,8 +4,8 @@
 This script listens for UDP audio packets on a multicast address, stores them in a
 shared ring buffer so the receiver process can decouple socket I/O from the audio
 callback thread, and streams the buffered PCM samples to the local speaker. It also
-optionally ducks AirPlay volume while playback is active so the local speaker output
-remains audible without overwhelming the AirPlay stream.
+optionally ducks AirPlay volume while playback is active, so the local speaker output
+remains audible without being overpowered by the AirPlay stream.
 """
 import array
 import json
