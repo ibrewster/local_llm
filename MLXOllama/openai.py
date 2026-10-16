@@ -112,7 +112,7 @@ async def chat_completions() -> Any:
         return _error(str(exc))
 
     # Reject if the inference queue is full
-    max_depth=4
+    max_depth=4 if images else 8
     depth=utils.inference_worker.pending_count()
     if depth >= max_depth:
         # Use a base wait of 30s plus random jitter of up to 30s so that
