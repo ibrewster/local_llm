@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import copy
 import datetime
+import itertools
 import json
 import logging
 import queue
@@ -377,21 +378,31 @@ def submit_inference(
         try:
             with utils.mlx_inference_lock:
                 mx.random.seed(int(time.time()))
-                # This runs in a worker thread
-                # stream_generate may use the processor/tokenizer internally;
-                # keep it under the same lock as request-side encode/decode.
+                # stream_generate uses the shared tokenizer during its setup phase
+                # (encoding the prompt, thinking token, creating the detokenizer).
+                # Once the first token is yielded, it only uses a local detokenizer
+                # copy, so the shared tokenizer is no longer needed.
+                # Hold tokenizer_lock only until the first yield to protect the
+                # setup phase, then release it so other threads can encode/decode
+                # their prompts during the generation loop.
+                gen = stream_generate(
+                    model,
+                    processor,
+                    prompt=formatted_prompt,
+                    image=opts.images,
+                    sampler=sampler,
+                    prompt_cache=cache,
+                    max_tokens=max_tokens,
+                    max_kv_size=max_kv_size
+                )
+                # Protect the setup phase where stream_generate uses the tokenizer
+                first_response = None
                 with utils.tokenizer_lock:
-                    for response in stream_generate(
-                        model,
-                        processor,
-                        prompt=formatted_prompt,
-                        image=opts.images,
-                        sampler=sampler,
-                        prompt_cache=cache,
-                        max_tokens=max_tokens,
-                        max_kv_size=max_kv_size
-                    ):
-                        put((response.text, response.token, False, None))
+                    first_response = next(gen)
+                # Generation loop uses only a local detokenizer copy;
+                # chain the first response with the rest to avoid duplicating put()
+                for response in itertools.chain((first_response,), gen):
+                    put((response.text, response.token, False, None))
 
                 cache_utils.dynamic_cache.insert_cache(
                     opts.model_name,
@@ -446,13 +457,16 @@ Good morning! Today is a clear day with scheduled tasks. Please review the upcom
 
         def thread_worker():
             with utils.mlx_inference_lock:
-                generate(
-                    model,
-                    processor,
-                    prompt=WARMUP_PROMPT,
-                    max_tokens=1,
-                    verbose=False,
-                )
+                # generate() uses the tokenizer internally to encode the prompt
+                # and set up the detokenizer. Protect it with tokenizer_lock.
+                with utils.tokenizer_lock:
+                    generate(
+                        model,
+                        processor,
+                        prompt=WARMUP_PROMPT,
+                        max_tokens=1,
+                        verbose=False,
+                    )
 
                 mx.synchronize()
         future = inference_worker.submit(thread_worker)
@@ -524,7 +538,8 @@ async def _stream_tokens(
 
         prompt_tokens=opts.prompt_tokens
         tokenizer = opts.processor.tokenizer
-        formatted_prompt = tokenizer.decode(prompt_tokens)
+        with utils.tokenizer_lock:
+            formatted_prompt = tokenizer.decode(prompt_tokens)
 
         if formatted_prompt.strip().endswith("<think>"):
             yield "<think>\n", False, None
