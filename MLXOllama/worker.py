@@ -103,20 +103,90 @@ alaskan_content = {
     ]
 }
 
+# WEEKLY_STYLES = {
+#     "Monday": "the gentle, repetitive, and reassuring style of 'Goodnight Moon'",
+#     "Tuesday": "the soft, comforting style of a classic woodland animal bedtime tale",
+#     "Wednesday": "the dreamy, celestial style of a poem about the night sky and drifting stars",
+#     "Thursday": "the warm, rustic style of a cozy fireside cabin settling down for a long winter night",
+#     "Friday": "the quiet, whispering style of gentle snowfall blanketed over the quiet woods",
+#     "Saturday": "the peaceful style of a tired traveler or musher resting by a calm, frozen river",
+#     "Sunday": "the lulling, melodic style of a soft northern breeze singing the trees to sleep"
+# }
+
 WEEKLY_STYLES = {
-    "Monday": "the gentle, repetitive, and reassuring style of 'Goodnight Moon'",
-    "Tuesday": "the soft, comforting style of a classic woodland animal bedtime tale",
-    "Wednesday": "the dreamy, celestial style of a poem about the night sky and drifting stars",
-    "Thursday": "the warm, rustic style of a cozy fireside cabin settling down for a long winter night",
-    "Friday": "the quiet, whispering style of gentle snowfall blanketed over the quiet woods",
-    "Saturday": "the peaceful style of a tired traveler or musher resting by a calm, frozen river",
-    "Sunday": "the lulling, melodic style of a soft northern breeze singing the trees to sleep"
+    "Monday": (
+        "A gentle goodnight litany inspired by classic repetitive bedtime picture books such as Goodnight Moon. "
+        "Build the ENTIRE poem around a series of simple, affectionate goodnights to familiar Alaskan things. "
+        "Sustain the same repetitive structure from the first line to the last. "
+        "Use short, plainspoken lines, repeated sentence patterns, playful noun pairings, "
+        "and occasional internal rhyme or alliteration. Make the repetition feel "
+        "comfortingly ritualistic, as though the whole world is being tucked into bed."
+    ),
+
+    "Tuesday": (
+        "A tiny woodland bedtime story with a beginning, a small event, and a peaceful "
+        "ending. Feature one or two gentle northern animals, such as a fox, hare, owl, "
+        "or red squirrel, doing something recognizable and endearing before settling "
+        "down for the night. Use concrete actions, simple dialogue or character-like "
+        "observations, and couplets whose rhymes emerge naturally from the story. "
+        "Let the SPECIAL_ITEM become a small, meaningful part of the animals' evening."
+    ),
+
+    "Wednesday": (
+        "A dreamy, celestial lullaby full of wonder, as if the sleeping world is floating "
+        "through a quiet, star-filled universe. Favor unusual but understandable metaphors, "
+        "personification, soft consonants, and imagery of drifting, floating, glowing, "
+        "and turning slowly. Let ordinary Fairbanks details become quietly magical, "
+        "without introducing actual fantasy creatures or events. Use fluid, lyrical lines "
+        "that feel weightless, while preserving clear end-rhymes and a sleepy cadence."
+    ),
+
+    "Thursday": (
+        "A cozy, homespun bedtime poem centered on the reassuring details of an "
+        "Alaskan home settling down for the night. Use tactile and sensory imagery "
+        "appropriate to the season: the hush of blankets, the creak of timber, the "
+        "glow of a lamp, the scent of supper, or the cool evening air drifting "
+        "through an open window. Favor familiar household objects, gentle "
+        "personification, and sturdy, conversational rhyming couplets. Make the "
+        "SPECIAL_ITEM feel as though it belongs naturally in this comfortable, "
+        "lived-in world."
+        ),
+
+    "Friday": (
+        "A hushed, contemplative poem in which the landscape gradually settles "
+        "into stillness. Let the language itself feel quiet and unhurried, using "
+        "spare vocabulary, short whisper-soft lines, deliberate pauses, and soft "
+        "sounds such as s, sh, and f. Draw imagery from the actual season and "
+        "weather: snow settling on branches, summer leaves barely stirring, "
+        "rain pattering on rooftops, or mist fading over the trees. Let the scene "
+        "grow progressively quieter, with fewer actions and a sense that the "
+        "whole landscape is holding its breath. Keep the rhymes gentle and "
+        "unshowy; avoid bouncy nursery-rhyme rhythms. Give the approaching "
+        "weekend a subtle feeling of release and rest."
+        ),
+
+    "Saturday": (
+        "A peaceful northern traveler's bedtime ballad, told by or about a weary but "
+        "contented traveler or musher reaching a safe resting place beside a "
+        "river or along a trail. Include a few concrete details of the journey: "
+        "footsteps, sled runners, bundled gear, distant spruce, the fading trail "
+        "behind, etc. Use steady, measured couplets with a walking rhythm and a hint of "
+        "traditional folk-song simplicity. Let the journey gradually give way to stillness, "
+        "shelter, and the satisfaction of having arrived."
+    ),
+
+    "Sunday": (
+        "A musical, flowing lullaby in which the northern breeze seems to sing the "
+        "world to sleep. Use recurring phrases, gentle refrains, flowing vowel sounds, "
+        "subtle alliteration, and lines that rise and fall like a slow melody. Personify "
+        "the wind, spruce branches, distant river, and night air as a quiet choir "
+        "settling down for the week. Make the cadence especially soothing and songlike, "
+        "with soft, predictable rhymes and a final phrase that feels like the last note "
+        "of a lullaby fading into silence."
+    ),
 }
 
-def gen_goodnight(prompt):
-    t0 = time.time()
-    logging.info("Goodnight generation beginning")
-
+def _build_goodnight_request(prompt):
     current_month = datetime.datetime.now().strftime("%B")
     day_of_year = datetime.datetime.now().timetuple().tm_yday
 
@@ -148,8 +218,15 @@ POEM_STYLE = {style_pick}
         top_p=0.92
     )
 
+    return message, sampler
+
+def gen_goodnight(prompt):
+    t0 = time.time()
+    logging.info("Goodnight generation beginning")
+
+    message, sampler = _build_goodnight_request(prompt)
     token_queue, _ = submit_inference_job(message, sampler=sampler, priority=True)
-    
+
     remainder = ""
     body_sentences = []
     sentence_index = 0
