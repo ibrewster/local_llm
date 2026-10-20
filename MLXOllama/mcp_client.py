@@ -23,7 +23,7 @@ class MCPService:
         client = await self.get_client()
         try:
             return await client.call_tool(tool_name, tool_args)
-        except (MCPError, ConnectionError, BrokenPipeError):
+        except (McpError, ConnectionError, BrokenPipeError):
             # If a server (like HA) restarted, reset and try once more
             self._initialized = False 
             client = await self.get_client()
