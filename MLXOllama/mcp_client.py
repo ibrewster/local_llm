@@ -1,6 +1,6 @@
 import asyncio
 from fastmcp.client import Client
-from mcp.shared.exceptions import McpError
+from mcp.shared.exceptions import MCPError
 
 class MCPService:
     def __init__(self, config):
@@ -23,7 +23,7 @@ class MCPService:
         client = await self.get_client()
         try:
             return await client.call_tool(tool_name, tool_args)
-        except (McpError, ConnectionError, BrokenPipeError):
+        except (MCPError, ConnectionError, BrokenPipeError):
             # If a server (like HA) restarted, reset and try once more
             self._initialized = False 
             client = await self.get_client()
