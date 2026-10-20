@@ -103,16 +103,6 @@ alaskan_content = {
     ]
 }
 
-# WEEKLY_STYLES = {
-#     "Monday": "the gentle, repetitive, and reassuring style of 'Goodnight Moon'",
-#     "Tuesday": "the soft, comforting style of a classic woodland animal bedtime tale",
-#     "Wednesday": "the dreamy, celestial style of a poem about the night sky and drifting stars",
-#     "Thursday": "the warm, rustic style of a cozy fireside cabin settling down for a long winter night",
-#     "Friday": "the quiet, whispering style of gentle snowfall blanketed over the quiet woods",
-#     "Saturday": "the peaceful style of a tired traveler or musher resting by a calm, frozen river",
-#     "Sunday": "the lulling, melodic style of a soft northern breeze singing the trees to sleep"
-# }
-
 WEEKLY_STYLES = {
     "Monday": (
         "A gentle goodnight litany inspired by classic repetitive bedtime picture books such as Goodnight Moon. "

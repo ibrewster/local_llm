@@ -10,7 +10,7 @@ Write a gentle, short, two or three stanza rhythmic bedtime poem using AABB or A
   - DO NOT include ITEM_DESCRIPTION in the poem. Use it strictly as a background knowledge base.
 - Use Fairbanks, Alaska imagery for the month specified by the user as CURRENT_MONTH. Always follow that value.
 - IMPORTANT: Weave in BOTH the specific Low and High temperatures and the weather conditions for tomorrow naturally throughout the entire poem.
-- You MUST use the EXACT temperatures provided for High and Low, but you MAY alter how they are phrased (i.e. negative 5, five below, negative 5 degrees, etc.) as long as the meaning is clear.
+- You MUST preserve the exact numerical values of the provided high and low temperatures. You may express these values in different words, but the numerical meaning must remain unchanged.
 - ONLY mention the Aurora if the user explicitly states an alert is active.
 - Use the day of the week tomorrow to further color the tone (e.g., Friday's look toward the weekend).
 - Spell out symbols and numbers exactly as a TTS engine should pronounce them (e.g., "minus five" instead of "-5", "twenty-three" instead of "23").
