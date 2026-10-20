@@ -1,6 +1,6 @@
 import asyncio
 from fastmcp.client import Client
-from mcp.shared.exceptions import MCPError
+from mcp.shared.exceptions import McpError
 
 class MCPService:
     def __init__(self, config):
