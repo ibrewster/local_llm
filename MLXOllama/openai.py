@@ -140,6 +140,10 @@ async def chat_completions() -> Any:
     tools = data.get("tools") or None
     think = data.get("think", False)
 
+    include_local = quart.request.headers.get("X-Include-Local-Tools", "false").lower() == "true"
+    if include_local:
+        tools = utils.merge_local_tools(tools)
+
     if not stream:
         final_chunk: JsonObject | None = None
         async for chunk_json in worker.generate_stream(

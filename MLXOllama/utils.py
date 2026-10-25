@@ -23,7 +23,7 @@ from mlx_vlm import sample_utils, load
 from mlx_vlm.utils import load_config
 from sentence_transformers import SentenceTransformer
 
-from . import config, mcp_client
+from . import config, local_tools, mcp_client
 from .preemptive_queue import PreemptiveQueue
 
 ##### GLOBAL OBJECTS#######
@@ -143,6 +143,16 @@ MCP_CLIENT_CONFIG = {
 }
 
 MCP_CLIENT=mcp_client.MCPService(MCP_CLIENT_CONFIG)
+
+# Standard MCP tools list — pre-computed at startup, used by merge_local_tools
+STANDARD_MCP_TOOLS: List[Dict] = []
+
+SKIPPED_MCP_TOOLS = {
+    'homeassistant_GetLiveContext',
+    'MCPAssist_perform_action',
+    'homeassistant_HassMediaSearchAndPlay',
+    'homeassistant_HassMediaPause'
+}
 
 mlx_inference_lock = threading.Lock()
 ###################
@@ -429,6 +439,71 @@ def parse_tool_calls(text: str) -> tuple[Optional[List[Dict]], str]:
 
     # No tool calls found → return None + original text
     return None, text.strip()
+
+async def build_standard_mcp_tools() -> List[Dict]:
+    """Fetch and transform MCP tools into OpenAI-compatible format.
+
+    Returns a list of tool schemas with skipped tools filtered out.
+    Used by ``mcp_tools_refresh_loop`` to periodically refresh
+    ``STANDARD_MCP_TOOLS``.
+    """
+    raw = await MCP_CLIENT.list_tools()
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description or "",
+                "parameters": tool.inputSchema,
+            },
+        }
+        for tool in raw
+        if tool.name not in SKIPPED_MCP_TOOLS
+    ]
+
+
+async def mcp_tools_refresh_loop():
+    """Background task that periodically refreshes the standard MCP tools list.
+
+    Runs every ``config.MCP_TOOLS_REFRESH_INTERVAL`` seconds, fetching the
+    latest MCP tools and updating ``STANDARD_MCP_TOOLS`` so that
+    ``merge_local_tools`` always sees a recent list without any per-request
+    async overhead.
+    """
+    while True:
+        try:
+            global STANDARD_MCP_TOOLS
+            STANDARD_MCP_TOOLS = await build_standard_mcp_tools()
+            logging.info(f"Refreshed {len(STANDARD_MCP_TOOLS)} standard MCP tools")
+        except Exception as e:
+            logging.error(f"MCP tools refresh failed: {e}", exc_info=True)
+        await asyncio.sleep(config.MCP_TOOLS_REFRESH_INTERVAL)
+
+
+def merge_local_tools(
+    tools: Optional[List[Dict]],
+) -> Optional[List[Dict]]:
+    """Merge server-side standard tools into the client-provided tools list.
+
+    Merges both ``STANDARD_MCP_TOOLS`` (pre-computed MCP tools) and
+    ``local_tools.LOCAL_TOOLS``.  When the client already supplied a
+    tools list, duplicates are skipped by tool name so the client's
+    version takes precedence.
+
+    Returns a new list (or ``None`` when no tools are involved).
+    """
+    all_server_tools = STANDARD_MCP_TOOLS + list(local_tools.LOCAL_TOOLS.values())
+
+    if tools is None:
+        return list(all_server_tools)
+
+    client_names = {t.get("function", {}).get("name") for t in tools}
+    merged = list(tools)  # shallow copy to avoid mutating the caller
+    for schema in all_server_tools:
+        if schema["function"]["name"] not in client_names:
+            merged.append(schema)
+    return merged
+
 
 def is_tool_response_request(messages: list) -> bool:
     """Check if this request is just delivering a tool result back to the LLM."""

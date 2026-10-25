@@ -486,12 +486,6 @@ async def refresh_cache_background():
     static_caches['HA'] = cache
 
 
-@cached(ttl=86400)
-async def get_tools():
-    mcp_tools = await MCP_CLIENT.list_tools()
-    return mcp_tools
-
-
 async def _morning_cache_factory(*_args, **_kwargs):
     return await create_morning_cache("")
 
@@ -522,35 +516,13 @@ async def create_bedtime_cache(*_args, **_kwargs):
 
 async def create_ha_cache(*_args, **_kwargs):
     from . import speak_queue
-    from .local_tools import LOCAL_TOOLS
 
     logging.info(f"Creating new Home Assistant cache")
     t0 = time.time()
     model_info = utils.loaded_models[config.MAIN_MODEL]
 
-    # Fetch the tools list.
-    mcp_tools = await get_tools()
-    skipped_tools = {
-        'homeassistant_GetLiveContext',
-        'MCPAssist_perform_action',
-        'homeassistant_HassMediaSearchAndPlay',
-        'homeassistant_HassMediaPause'
-    }
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description or "",
-                "parameters": tool.inputSchema,
-            },
-        }
-        for tool in mcp_tools
-        if tool.name not in skipped_tools
-    ]
-
-    # Add local tools
-    tools += LOCAL_TOOLS.values()
+    # Use the pre-computed standard tools list (MCP + local tools)
+    tools = utils.merge_local_tools(None)
 
     live_context = await get_live_context()
     entity_ids = await get_entity_ids()

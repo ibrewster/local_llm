@@ -193,6 +193,11 @@ async def api_chat():
     stream = data.get("stream", True)
     tools = data.get("tools") or None
     think = data.get("think", False)
+
+    include_local = quart.request.headers.get("X-Include-Local-Tools", "false").lower() == "true"
+    if include_local:
+        tools = utils.merge_local_tools(tools)
+
     model_info = utils.loaded_models[model_name]
     
     last_message = message_text(messages[-1].get('content', '')).strip() if messages and messages[-1].get('role') == 'user' else ''
@@ -352,6 +357,15 @@ async def startup():
     global _whisper_process
     
     await utils.MCP_CLIENT.get_client() # ensures it is connected.
+    
+    # Prime the MCP tools list immediately, then start background refresh
+    utils.STANDARD_MCP_TOOLS = await utils.build_standard_mcp_tools()
+    logging.info(f"Loaded {len(utils.STANDARD_MCP_TOOLS)} standard MCP tools")
+    
+    asyncio.create_task(
+        utils.mcp_tools_refresh_loop(),
+        name="MCP_Tools_Refresh"
+    )
     
     asyncio.create_task(
         cache_utils.cache_refresh_loop(),

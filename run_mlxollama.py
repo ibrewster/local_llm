@@ -15,7 +15,7 @@ from hypercorn.asyncio import serve
 import MLXOllama # Sets the HF_HOME config
 from MLXOllama import tts_streamer
 
-from services import parakeet
+from services import parakeet, litellm_runner
 
 def _sigterm_handler(_signum, _frame):
     os.kill(os.getpid(), signal.SIGINT)
@@ -26,13 +26,16 @@ signal.signal(signal.SIGTERM, _sigterm_handler)
 if __name__ == "__main__":    
     logging.info("Starting Parakeet Server")
     parakeet_process=parakeet.start_parakeet_process()
-
     logging.info("Parakeet process PID: %d", parakeet_process.pid)
     
     logging.info("Starting TTS process")
     MLXOllama.tts_queue = multiprocessing.Queue()
     tts_process = tts_streamer.TTSStreamer(MLXOllama.tts_queue)
-    tts_process.start()    
+    tts_process.start()
+
+    logging.info("Starting litellm proxy server")
+    litellm_process = litellm_runner.start_litellm_process()
+    logging.info("litellm process PID: %d", litellm_process.pid)
     
     hconfig = Config()
     hconfig.bind = ["0.0.0.0:11434"]
@@ -52,22 +55,19 @@ if __name__ == "__main__":
     MLXOllama.speak_queue.put("QUIT")
     MLXOllama.process_thread.join()
     
-    if parakeet_process and parakeet_process.is_alive():
-        MLXOllama.app.logger.info("Shutting down Parakeet Process...")
-        parakeet_process.terminate()
-        parakeet_process.join(timeout=5)
-        if parakeet_process.is_alive():
-            logging.warning("Parakeet process did not terminate within 5 seconds. Killing...")
-            parakeet_process.kill()
-        MLXOllama.app.logger.info("Parakeet process stopped")
-        
-    if tts_process and tts_process.is_alive():
-        MLXOllama.app.logger.info("Shutting down Speaker process")
-        tts_process.terminate()
-        tts_process.join(timeout=5)
-        if tts_process.is_alive():
-            tts_process.kill()
-        MLXOllama.app.logger.info("Speaker process stopped")
+    for name, process in [
+        ("Parakeet", parakeet_process),
+        ("Speaker", tts_process),
+        ("litellm", litellm_process),
+    ]:
+        if process and process.is_alive():
+            MLXOllama.app.logger.info(f"Shutting down {name} process...")
+            process.terminate()
+            process.join(timeout=5)
+            if process.is_alive():
+                MLXOllama.app.logger.warning(f"{name} process did not terminate within 5 seconds. Killing...")
+                process.kill()
+            MLXOllama.app.logger.info(f"{name} process stopped")
     
     MLXOllama.utils.inference_worker.shutdown()
         

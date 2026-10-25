@@ -27,3 +27,6 @@ httpx
 hypercorn
 huggingface-hub
 diskcache
+
+pyyaml
+litellm
