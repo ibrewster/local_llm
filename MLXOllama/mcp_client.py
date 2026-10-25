@@ -1,11 +1,10 @@
 import asyncio
 from fastmcp.client import Client
-from mcp.shared.exceptions import McpError
+from fastmcp.exceptions import MCPError, ClientError
 
 class MCPService:
     def __init__(self, config):
         self.config = config
-        # auto_initialize=False prevents the startup log warnings
         self._client = Client(self.config)
         self._initialized = False
         self._lock = asyncio.Lock()
@@ -19,13 +18,24 @@ class MCPService:
                 self._initialized = True
             return self._client
 
+    async def reset(self):
+        """Resets the client connection and state."""
+        async with self._lock:
+            if self._initialized:
+                try:
+                    await self._client.close()
+                except Exception:
+                    pass
+                self._initialized = False
+            self._client = Client(self.config)
+
     async def call_tool(self, tool_name, tool_args=None):
-        client = await self.get_client()
         try:
+            client = await self.get_client()
             return await client.call_tool(tool_name, tool_args)
-        except (McpError, ConnectionError, BrokenPipeError):
-            # If a server (like HA) restarted, reset and try once more
-            self._initialized = False 
+        except (MCPError, ClientError, ConnectionError, BrokenPipeError):
+            # If server restarted or connection dropped, reset and retry once
+            await self.reset()
             client = await self.get_client()
             return await client.call_tool(tool_name, tool_args)
 
@@ -36,6 +46,7 @@ class MCPService:
         return tools
 
     async def close(self):
-        if self._initialized:
-            await self._client.__aexit__(None, None, None)
-            await self._client.close()
+        async with self._lock:
+            if self._initialized:
+                await self._client.close()
+                self._initialized = False
