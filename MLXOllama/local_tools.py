@@ -26,7 +26,7 @@ import pytz
 
 from rapidfuzz import process, fuzz, utils
 
-from . import cache_utils, config
+from . import config
 from .async_ttl_cache import async_ttl_cache
 from .config import BRAVE_SEARCH_API_KEY
 
@@ -752,6 +752,7 @@ async def search_music(query: str, limit: int = 10):
     -------
     Matching albums, artists, and tracks.
     """
+    from . import cache_utils
     results = {
         'albums': [],
         'artists': [],

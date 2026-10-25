@@ -30,3 +30,4 @@ diskcache
 
 pyyaml
 litellm
+litellm[proxy]
