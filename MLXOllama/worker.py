@@ -6,6 +6,7 @@ import itertools
 import json
 import logging
 import queue
+import threading
 import time
 import random
 import re
@@ -422,9 +423,10 @@ def submit_inference(
     *, 
     sampler=None,
     max_kv_size=None,
-        max_tokens:int = 256, # Default from mlx-vlm
+    max_tokens:int = 256, # Default from mlx-vlm
     loop: asyncio.AbstractEventLoop | None = None,
-    priority: bool = False
+    priority: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[queue.Queue | asyncio.Queue, concurrent.futures.Future]:
     
     token_queue = asyncio.Queue() if loop else queue.Queue()
@@ -438,6 +440,9 @@ def submit_inference(
     def thread_worker():
         model = opts.model
         processor = opts.processor
+        if cancel_event is not None and cancel_event.is_set():
+            put(("", None, True, None))
+            return
         with utils.tokenizer_lock:
             formatted_prompt = opts.processor.tokenizer.decode(opts.prompt_tokens)
         cache = opts.cache
@@ -469,13 +474,16 @@ def submit_inference(
                 # Generation loop uses only a local detokenizer copy;
                 # chain the first response with the rest to avoid duplicating put()
                 for response in itertools.chain((first_response,), gen):
+                    if cancel_event is not None and cancel_event.is_set():
+                        break
                     put((response.text, response.token, False, None))
 
-                cache_utils.dynamic_cache.insert_cache(
-                    opts.model_name,
-                    base_tokens,
-                    cache
-                )
+                if cancel_event is None or not cancel_event.is_set():
+                    cache_utils.dynamic_cache.insert_cache(
+                        opts.model_name,
+                        base_tokens,
+                        cache
+                    )
             put(("", None, True, None))
 
         except Exception as e:
@@ -577,6 +585,10 @@ async def _stream_tokens(
     if state is None:
         state = {}
 
+    # The Open WebUI task marker changes formatting preferences, not the
+    # caller's output budget. Keep per-call changes isolated from later steps.
+    options = dict(options)
+
     t0 = time.time_ns()
     eval_count = 0
     try:
@@ -586,7 +598,6 @@ async def _stream_tokens(
         if "### task:" in message_text(msg_history[-1].get("content", "")).lower():
             options['temp'] = 0.1
             think = False
-            options['max_tokens'] = 256
             
         opts = await setup_inference(
             msg_history,
@@ -598,9 +609,11 @@ async def _stream_tokens(
 
         sampler = sample_utils.make_sampler(
             temp=options.get("temp", 0.65),
-            min_p=0.05,
-            xtc_probability=0.5,
-            xtc_threshold=0.1
+            top_p=options.get("top_p", 0.0),
+            top_k=options.get("top_k", 0),
+            min_p=options.get("min_p", 0.05),
+            xtc_probability=options.get("xtc_probability", 0.5),
+            xtc_threshold=options.get("xtc_threshold", 0.1),
         )
 
         prompt_tokens=opts.prompt_tokens
@@ -632,7 +645,8 @@ async def _stream_tokens(
                 sampler=sampler,
                 max_tokens=safe_max,
                 loop=loop,
-                priority=priority)
+                priority=priority,
+                cancel_event=options.get("cancel_event"))
         )
         state['future'] = future
 

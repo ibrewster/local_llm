@@ -556,6 +556,313 @@ class TestPlanAndExecuteWithTools(unittest.TestCase):
         self.assertEqual(tools_per_call[1], mock_tools)
 
 
+class TestAgenticExecutionQuality(unittest.TestCase):
+    """Regression tests for streaming, clean step output, and final synthesis."""
+
+    def test_thinking_is_streamed_but_not_saved_as_completion_content(self):
+        async def run_test():
+            streamed = []
+
+            async def mock_generate_stream(**kwargs):
+                self.assertTrue(kwargs["stream"])
+                yield {"message": {"role": "assistant", "content": "<thought>private reasoning</thought>"}}
+                yield {"message": {"role": "assistant", "content": "User-facing answer."}}
+                yield {"message": {"role": "assistant", "content": ""}, "done": True}
+
+            async def on_token(token):
+                streamed.append(token)
+
+            with patch.object(agentic_module.worker, "generate_stream", mock_generate_stream):
+                result = await agentic_module._collect_completion(
+                    [], {"name": "test-model"}, {}, think=True, on_token=on_token
+                )
+            return result, streamed
+
+        result, streamed = asyncio.run(run_test())
+        self.assertIn("private reasoning", "".join(streamed))
+        self.assertEqual(result["content"], "User-facing answer.")
+
+    def test_tool_calls_are_kept_when_the_terminal_stream_chunk_is_empty(self):
+        expected_call = {
+            "id": "call_remote",
+            "type": "function",
+            "function": {"name": "remote_lookup", "arguments": {"query": "test"}},
+        }
+
+        async def run_test():
+            streamed = []
+
+            async def mock_generate_stream(**kwargs):
+                yield {"message": {"role": "assistant", "content": "Checking now."}, "done": False}
+                yield {"message": {"role": "assistant", "content": "", "tool_calls": [expected_call]}, "done": False}
+                yield {
+                    "message": {"role": "assistant", "content": ""},
+                    "done": True,
+                    "done_reason": "tool_call",
+                }
+                yield {"message": {"role": "assistant", "content": "must not be consumed"}, "done": True}
+
+            async def on_token(token):
+                streamed.append(token)
+
+            with patch.object(agentic_module.worker, "generate_stream", mock_generate_stream):
+                result = await agentic_module._collect_completion(
+                    [], {"name": "test-model"}, {}, on_token=on_token
+                )
+            return result, streamed
+
+        result, streamed = asyncio.run(run_test())
+        self.assertEqual(result["tool_calls"], [expected_call])
+        self.assertEqual(result["done_reason"], "tool_call")
+        self.assertEqual(result["content"], "Checking now.")
+        self.assertEqual(streamed, ["Checking now."])
+
+    def test_failure_replans_and_final_answer_is_generated(self):
+        responses = iter([
+            "1. Try the unavailable approach",
+            "I cannot complete this step with the available information.",
+            "1. Use the provided data instead",
+            "The provided data resolves the task.",
+            "Here is the final answer.",
+        ])
+
+        async def run_test():
+            async def mock_generate_stream(stream=False, **kwargs):
+                yield {"message": {"role": "assistant", "content": next(responses)}, "done": True}
+
+            with patch.object(agentic_module.worker, "generate_stream", mock_generate_stream):
+                return await plan_and_execute("Complete this request", model_name="test-model")
+
+        result = asyncio.run(run_test())
+        self.assertIn("The provided data resolves the task.", result["content"])
+        self.assertIn("Here is the final answer.", result["content"])
+        self.assertNotIn("I cannot complete this step", result["content"])
+
+    def test_agent_sampling_is_deterministic_and_request_options_are_isolated(self):
+        captured_options = []
+        responses = iter(["1. Perform the task", "Step output", "Final response"])
+
+        async def run_test():
+            async def mock_generate_stream(stream=False, options=None, **kwargs):
+                captured_options.append(options)
+                yield {"message": {"role": "assistant", "content": next(responses)}, "done": True}
+
+            with patch.object(agentic_module.worker, "generate_stream", mock_generate_stream):
+                await plan_and_execute(
+                    "Test request", model_name="test-model", temperature=0.25, top_p=0.9, top_k=40
+                )
+
+        asyncio.run(run_test())
+        self.assertEqual(len(captured_options), 3)
+        self.assertEqual(captured_options[0]["temp"], 0.25)
+        self.assertEqual(captured_options[0]["top_p"], 0.9)
+        self.assertEqual(captured_options[0]["top_k"], 40)
+        self.assertEqual(captured_options[0]["xtc_probability"], 0.0)
+        self.assertEqual(len({id(options) for options in captured_options}), 3)
+
+    def test_open_webui_task_prompt_skips_planning_without_lowering_token_limit(self):
+        captured = []
+
+        async def run_test():
+            async def mock_generate_stream(stream=False, options=None, think=True, **kwargs):
+                captured.append((options, think))
+                yield {"message": {"role": "assistant", "content": "Direct completion"}, "done": True}
+
+            with patch.object(agentic_module.worker, "generate_stream", mock_generate_stream):
+                return await plan_and_execute(
+                    "### Task: respond directly", model_name="test-model", max_tokens=9000
+                )
+
+        result = asyncio.run(run_test())
+        self.assertEqual(result["content"], "Direct completion")
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][0]["max_tokens"], 9000)
+        self.assertFalse(captured[0][1])
+
+    def test_resume_returns_only_output_generated_after_the_tool_round_trip(self):
+        session = agentic_module.AgenticSession(
+            session_id="resume-delta-session",
+            prompt="Complete the task",
+            model_name="test-model",
+            plan_system_prompt="Plan",
+            execute_system_prompt="Execute",
+            max_steps=5,
+            tools=[],
+            steps=["First completed step", "Second step", "Final step"],
+            current_step_index=2,
+            step_outputs=["Earlier output must not be repeated"],
+            accumulated="\n\n--- Step 1: First completed step ---\nEarlier output must not be repeated",
+            execute_messages=[{"role": "system", "content": "Execute"}],
+            pending_tool_calls=[],
+        )
+        agentic_module._save_session(session)
+        responses = iter(["New result", "Later result", "Final answer"])
+
+        async def run_test():
+            async def mock_generate_stream(stream=False, **kwargs):
+                yield {"message": {"role": "assistant", "content": next(responses)}, "done": True}
+
+            with patch.object(agentic_module.worker, "generate_stream", mock_generate_stream):
+                return await plan_and_execute(
+                    "ignored continuation prompt", model_name="test-model", session_id=session.session_id
+                )
+
+        result = asyncio.run(run_test())
+        self.assertIn("New result", result["content"])
+        self.assertIn("Later result", result["content"])
+        self.assertNotIn("Earlier output must not be repeated", result["content"])
+        self.assertIsNone(agentic_module._get_session(session.session_id))
+
+    def test_tool_call_id_can_locate_a_resumable_session(self):
+        session = agentic_module.AgenticSession(
+            session_id="tool-id-session",
+            prompt="Test",
+            model_name="test-model",
+            plan_system_prompt="Plan",
+            execute_system_prompt="Execute",
+            max_steps=2,
+            tools=[],
+            steps=["Use a tool"],
+            current_step_index=1,
+            step_outputs=[],
+            accumulated="",
+            execute_messages=[],
+            pending_tool_calls=[{"id": "call_lookup", "function": {"name": "lookup", "arguments": "{}"}}],
+        )
+        agentic_module._save_session(session)
+        found = agentic_module._find_session_by_tool_call_ids([
+            {"role": "tool", "tool_call_id": "call_lookup", "content": "result"},
+        ])
+        self.assertIs(found, session)
+        agentic_module._remove_session(session.session_id)
+
+    def test_incomplete_tool_results_do_not_mutate_a_session(self):
+        session = agentic_module.AgenticSession(
+            session_id="partial-tools-session",
+            prompt="Test",
+            model_name="test-model",
+            plan_system_prompt="Plan",
+            execute_system_prompt="Execute",
+            max_steps=2,
+            tools=[],
+            steps=["Use two tools"],
+            current_step_index=1,
+            step_outputs=[],
+            accumulated="",
+            execute_messages=[{"role": "system", "content": "Execute"}],
+            pending_tool_calls=[
+                {"id": "call_one", "function": {"name": "one", "arguments": "{}"}},
+                {"id": "call_two", "function": {"name": "two", "arguments": "{}"}},
+            ],
+        )
+        injected = agentic_module._inject_tool_results_into_session(session, [
+            {"role": "tool", "tool_call_id": "call_one", "content": "first result"},
+        ])
+        self.assertFalse(injected)
+        self.assertEqual(len(session.execute_messages), 1)
+        self.assertEqual(len(session.pending_tool_calls), 2)
+
+
+class TestAgenticStreamingEndpoint(unittest.TestCase):
+    def _prepare_endpoint(self, plan_and_execute_mock):
+        class CapturedResponse:
+            def __init__(self, body, mimetype=None):
+                self.body = body
+                self.mimetype = mimetype
+                self.headers = {}
+
+        data = {
+            "messages": [{"role": "user", "content": "Run the requested action"}],
+            "stream": True,
+        }
+        patches = [
+            patch.object(agentic_module, "read_chat_request", AsyncMock(return_value=(data, []))),
+            patch.object(agentic_module.utils, "loaded_models", {"test-model": {"name": "test-model"}}),
+            patch.object(agentic_module.utils, "inference_worker", MagicMock(pending_count=MagicMock(return_value=0))),
+            patch.object(agentic_module.quart, "Response", CapturedResponse),
+            patch.object(agentic_module, "plan_and_execute", plan_and_execute_mock),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return CapturedResponse
+
+    def test_stream_finishes_tool_call_with_one_terminal_chunk_and_done(self):
+        async def fake_plan_and_execute(prompt, **kwargs):
+            await kwargs["on_token"]("<thought>reasoning</thought>")
+            return {
+                "tool_calls": [{
+                    "id": "call_stream",
+                    "type": "function",
+                    "function": {"name": "remote", "arguments": {"query": "test"}},
+                }],
+                "session_id": "session-stream",
+            }
+
+        self._prepare_endpoint(fake_plan_and_execute)
+
+        async def run_test():
+            response = await agentic_module.agentic_completions()
+            return [frame async for frame in response.body]
+
+        frames = asyncio.run(run_test())
+        data_frames = [json.loads(frame[6:]) for frame in frames if frame.startswith("data: {")]
+        finish_reasons = [
+            item["choices"][0].get("finish_reason")
+            for item in data_frames if item.get("choices")
+        ]
+        self.assertEqual(finish_reasons.count("tool_calls"), 1)
+        self.assertEqual(frames[-1], "data: [DONE]\n\n")
+        self.assertTrue(any("<thought>reasoning</thought>" in frame for frame in frames))
+
+    def test_stream_reports_errors_and_finishes(self):
+        async def fake_plan_and_execute(prompt, **kwargs):
+            raise RuntimeError("agent failure")
+
+        self._prepare_endpoint(fake_plan_and_execute)
+
+        async def run_test():
+            response = await agentic_module.agentic_completions()
+            return [frame async for frame in response.body]
+
+        frames = asyncio.run(run_test())
+        self.assertTrue(any('"message": "agent failure"' in frame for frame in frames))
+        self.assertEqual(frames[-1], "data: [DONE]\n\n")
+
+    def test_client_disconnect_signals_cancellation(self):
+        shared = {}
+
+        async def fake_plan_and_execute(prompt, **kwargs):
+            shared["cancel_event"] = kwargs["cancel_event"]
+            shared["started"].set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                shared["cancelled"].set()
+                raise
+
+        self._prepare_endpoint(fake_plan_and_execute)
+
+        async def run_test():
+            shared["started"] = asyncio.Event()
+            shared["cancelled"] = asyncio.Event()
+            response = await agentic_module.agentic_completions()
+            stream = response.body
+            self.assertEqual(await stream.__anext__(), ":\n\n")
+            next_chunk = asyncio.create_task(stream.__anext__())
+            await shared["started"].wait()
+            next_chunk.cancel()
+            try:
+                await next_chunk
+            except asyncio.CancelledError:
+                pass
+            return shared["cancel_event"].is_set(), shared["cancelled"].is_set()
+
+        event_set, task_cancelled = asyncio.run(run_test())
+        self.assertTrue(event_set)
+        self.assertTrue(task_cancelled)
+
+
 class TestToolCallingRoundTrip(unittest.TestCase):
     """Test the full tool-calling round-trip: plan → tool call → client executes → resume → final answer."""
 
@@ -649,9 +956,9 @@ class TestToolCallingRoundTrip(unittest.TestCase):
                     session_id=session_id,
                 )
 
-            return result2
+                return result2, session_id
 
-        result = asyncio.run(run_test())
+        result, session_id = asyncio.run(run_test())
 
         # Should have completed all steps
         content = result["content"]
@@ -659,7 +966,7 @@ class TestToolCallingRoundTrip(unittest.TestCase):
         self.assertIn("Step 2:", content)
         self.assertNotIn("tool_calls", result)
         # Session should be cleaned up
-        self.assertIsNone(agentic_module._get_session("test-session"))
+        self.assertIsNone(agentic_module._get_session(session_id))
 
     def test_full_round_trip_with_http_helpers(self):
         """Test helper functions used by the HTTP endpoint for continuation detection."""
@@ -675,15 +982,18 @@ class TestToolCallingRoundTrip(unittest.TestCase):
 
         self.assertTrue(agentic_module._has_tool_results(messages_with_tool))
         self.assertFalse(agentic_module._has_tool_results(messages_without_tool))
+        self.assertFalse(agentic_module._has_tool_results(messages_with_tool + [
+            {"role": "user", "content": "And what about tomorrow?"},
+        ]))
 
         # Test _extract_session_id
         data_with_session = {"session_id": "abc123"}
         data_with_metadata = {"metadata": {"agentic_session_id": "def456"}}
         data_without_session = {}
 
-        self.assertEqual(agentic_module._extract_session_id([], data_with_session), "abc123")
-        self.assertEqual(agentic_module._extract_session_id([], data_with_metadata), "def456")
-        self.assertIsNone(agentic_module._extract_session_id([], data_without_session))
+        self.assertEqual(agentic_module._extract_session_id(data_with_session), "abc123")
+        self.assertEqual(agentic_module._extract_session_id(data_with_metadata), "def456")
+        self.assertIsNone(agentic_module._extract_session_id(data_without_session))
 
     def test_inject_tool_results_into_session(self):
         """Test that tool results are properly injected into a session's execute messages."""
@@ -710,8 +1020,10 @@ class TestToolCallingRoundTrip(unittest.TestCase):
 
         messages = [
             {"role": "user", "content": "What's the weather?"},
+            {"role": "tool", "content": "stale result", "tool_call_id": "old_call"},
             {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "function": {"name": "get_weather", "arguments": "{}"}}]},
             {"role": "tool", "content": "72°F, sunny", "tool_call_id": "call_1"},
+            {"role": "tool", "content": "duplicate result", "tool_call_id": "call_1"},
         ]
 
         agentic_module._inject_tool_results_into_session(session, messages)
@@ -733,7 +1045,7 @@ class TestSessionCleanup(unittest.TestCase):
         """Test that expired sessions are removed by cleanup."""
         import time
 
-        # Create an expired session (created 1 hour ago)
+        # Create a session whose last activity was 1 hour ago.
         expired_session = agentic_module.AgenticSession(
             session_id="expired-session",
             prompt="Test",
@@ -751,6 +1063,7 @@ class TestSessionCleanup(unittest.TestCase):
             created_at=time.time() - 3600,  # 1 hour ago
         )
         agentic_module._save_session(expired_session)
+        expired_session.last_active = time.time() - 3600
 
         # Create a fresh session
         fresh_session = agentic_module.AgenticSession(
@@ -791,7 +1104,7 @@ class TestMaxTokens(unittest.TestCase):
     """Test that max_tokens is properly passed through."""
 
     def test_max_tokens_default(self):
-        """Test that default max_tokens is 4096."""
+        """Test that default max_tokens is high enough for agent responses."""
         plan_response = "1. Step one"
 
         async def run_test():
@@ -810,8 +1123,8 @@ class TestMaxTokens(unittest.TestCase):
             return captured_options
 
         options_list = asyncio.run(run_test())
-        # Default max_tokens should be 4096
-        self.assertEqual(options_list[0]["max_tokens"], 4096)
+        self.assertEqual(options_list[0]["max_tokens"], agentic_module.DEFAULT_MAX_TOKENS)
+        self.assertEqual(options_list[0]["xtc_probability"], 0.0)
 
     def test_max_tokens_custom(self):
         """Test that custom max_tokens is passed through."""
