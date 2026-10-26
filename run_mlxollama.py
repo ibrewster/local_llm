@@ -33,9 +33,11 @@ if __name__ == "__main__":
     tts_process = tts_streamer.TTSStreamer(MLXOllama.tts_queue)
     tts_process.start()
 
-    logging.info("Starting litellm proxy server")
-    litellm_process = litellm_runner.start_litellm_process()
-    logging.info("litellm process PID: %d", litellm_process.pid)
+    # Creates a litellm proxy in front of our server
+    # Usefull if we want to add additional protocols or authentication in the future
+    # logging.info("Starting litellm proxy server")
+    # litellm_process = litellm_runner.start_litellm_process()
+    # logging.info("litellm process PID: %d", litellm_process.pid)
     
     hconfig = Config()
     hconfig.bind = ["0.0.0.0:11434"]
@@ -58,16 +60,18 @@ if __name__ == "__main__":
     for name, process in [
         ("Parakeet", parakeet_process),
         ("Speaker", tts_process),
-        ("litellm", litellm_process),
+#        ("litellm", litellm_process),
     ]:
+        MLXOllama.app.logger.info(f"Shutting down {name} process...")
         if process and process.is_alive():
-            MLXOllama.app.logger.info(f"Shutting down {name} process...")
             process.terminate()
             process.join(timeout=5)
             if process.is_alive():
                 MLXOllama.app.logger.warning(f"{name} process did not terminate within 5 seconds. Killing...")
                 process.kill()
             MLXOllama.app.logger.info(f"{name} process stopped")
+        else:
+            MLXOllama.app.logger.info(f"{name} process was not running")
     
     MLXOllama.utils.inference_worker.shutdown()
         

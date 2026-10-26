@@ -1,7 +1,7 @@
 import asyncio
 import json
-import multiprocessing
 import logging
+import multiprocessing
 
 from pathlib import Path
 

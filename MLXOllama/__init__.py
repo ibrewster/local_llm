@@ -53,4 +53,4 @@ def setup_app():
     logging.getLogger(app.name).removeHandler(default_handler)
     app.logger.propagate = True
     
-    from . import main
+    from . import main, agentic_worker
