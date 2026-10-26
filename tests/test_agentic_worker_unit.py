@@ -620,10 +620,154 @@ class TestAgenticExecutionQuality(unittest.TestCase):
     def test_failure_replans_and_final_answer_is_generated(self):
         responses = iter([
             "1. Try the unavailable approach",
-            "I cannot complete this step with the available information.",
+            "Could not access the requested source.\nSTEP_FAILED: source unavailable",
+            "The alternate attempt also reached a dead end.\nSTEP_FAILED: source unavailable",
             "1. Use the provided data instead",
             "The provided data resolves the task.",
             "Here is the final answer.",
+        ])
+
+        async def run_test():
+            captured_messages = []
+
+            async def mock_generate_stream(stream=False, **kwargs):
+                captured_messages.append(kwargs.get("msg_history", []))
+                yield {"message": {"role": "assistant", "content": next(responses)}, "done": True}
+
+            with patch.object(agentic_module.worker, "generate_stream", mock_generate_stream):
+                result = await plan_and_execute("Complete this request", model_name="test-model")
+            return result, captured_messages
+
+        result, captured_messages = asyncio.run(run_test())
+        self.assertIn("The provided data resolves the task.", result["content"])
+        self.assertIn("Here is the final answer.", result["content"])
+        self.assertNotIn("source unavailable", result["content"])
+        self.assertEqual(len(captured_messages), 6)
+        retry_request = captured_messages[2][-1]["content"]
+        self.assertIn("Previous attempt failed because source unavailable", retry_request)
+        self.assertIn("Try a different approach for this same step", retry_request)
+
+    def test_failure_retry_can_recover_without_replanning(self):
+        responses = iter([
+            "1. Complete the task",
+            "The first approach failed.\nSTEP_FAILED: missing source",
+            "Recovered using the available context.",
+            "Final response.",
+        ])
+
+        async def run_test():
+            captured_messages = []
+
+            async def mock_generate_stream(stream=False, **kwargs):
+                captured_messages.append(kwargs.get("msg_history", []))
+                yield {"message": {"role": "assistant", "content": next(responses)}, "done": True}
+
+            with patch.object(agentic_module.worker, "generate_stream", mock_generate_stream):
+                result = await plan_and_execute("Complete this request", model_name="test-model")
+            return result, captured_messages
+
+        result, captured_messages = asyncio.run(run_test())
+        self.assertIn("Recovered using the available context.", result["content"])
+        self.assertNotIn("[Step failed:", result["content"])
+        self.assertEqual(len(captured_messages), 4)
+        self.assertIn("Previous attempt failed because missing source", captured_messages[2][-1]["content"])
+
+    def test_partial_result_is_retained_without_replanning(self):
+        responses = iter([
+            "1. Gather the available information\n2. Summarize it",
+            "Found a useful lead.\nSTEP_PARTIAL: one source unavailable",
+            "The lead supports the summary.",
+            "Final response.",
+        ])
+
+        async def run_test():
+            captured_messages = []
+
+            async def mock_generate_stream(stream=False, **kwargs):
+                captured_messages.append(kwargs.get("msg_history", []))
+                yield {"message": {"role": "assistant", "content": next(responses)}, "done": True}
+
+            with patch.object(agentic_module.worker, "generate_stream", mock_generate_stream):
+                result = await plan_and_execute("Summarize the available information", model_name="test-model")
+            return result, captured_messages
+
+        result, captured_messages = asyncio.run(run_test())
+        self.assertIn("[Partial result: one source unavailable]", result["content"])
+        self.assertIn("Found a useful lead.", result["content"])
+        self.assertIn("[Partial result: one source unavailable]", captured_messages[2][-1]["content"])
+        self.assertEqual(len(captured_messages), 4)
+
+    def test_fuzzy_failure_language_does_not_trigger_replanning(self):
+        responses = iter([
+            "1. Explain the limitation\n2. Complete the request",
+            "I cannot verify the live value, but the supplied data is sufficient.",
+            "Completed using the supplied data.",
+            "Final response.",
+        ])
+
+        async def run_test():
+            captured_messages = []
+
+            async def mock_generate_stream(stream=False, **kwargs):
+                captured_messages.append(kwargs.get("msg_history", []))
+                yield {"message": {"role": "assistant", "content": next(responses)}, "done": True}
+
+            with patch.object(agentic_module.worker, "generate_stream", mock_generate_stream):
+                result = await plan_and_execute("Complete this request", model_name="test-model")
+            return result, captured_messages
+
+        result, captured_messages = asyncio.run(run_test())
+        self.assertIn("I cannot verify the live value", result["content"])
+        self.assertIn("Completed using the supplied data.", result["content"])
+        self.assertEqual(len(captured_messages), 4)
+
+    def test_plan_health_check_replaces_remaining_steps(self):
+        responses = iter([
+            "1. Inspect the request\n2. Gather facts\n3. Compare facts\n4. Draft an outdated-format report",
+            "Request inspected.",
+            "Facts gathered.",
+            "The requested format is incompatible with the gathered data.",
+            "NEEDS_REPLAN: the report format cannot represent the available facts",
+            "1. Create a concise text summary",
+            "Created a concise text summary.",
+            "Final response.",
+        ])
+
+        async def run_test():
+            captured_calls = []
+
+            async def mock_generate_stream(stream=False, options=None, tools=None, think=True, **kwargs):
+                captured_calls.append({
+                    "messages": kwargs.get("msg_history", []),
+                    "options": options,
+                    "tools": tools,
+                    "think": think,
+                })
+                yield {"message": {"role": "assistant", "content": next(responses)}, "done": True}
+
+            with patch.object(agentic_module.worker, "generate_stream", mock_generate_stream):
+                result = await plan_and_execute("Prepare a report", model_name="test-model")
+            return result, captured_calls
+
+        result, captured_calls = asyncio.run(run_test())
+        self.assertIn("Created a concise text summary.", result["content"])
+        self.assertNotIn("Draft an outdated-format report", result["content"])
+        self.assertEqual(len(captured_calls), 8)
+        health_check = captured_calls[4]
+        self.assertEqual(health_check["think"], False)
+        self.assertIsNone(health_check["tools"])
+        self.assertEqual(health_check["options"]["max_tokens"], agentic_module.ON_TRACK_MAX_TOKENS)
+        self.assertIn("Original goal:", health_check["messages"][-1]["content"])
+
+    def test_plan_health_check_keeps_plan_when_on_track(self):
+        responses = iter([
+            "1. First action\n2. Second action\n3. Third action\n4. Final action",
+            "First done.",
+            "Second done.",
+            "Third done.",
+            "ON_TRACK",
+            "Final action done.",
+            "Final response.",
         ])
 
         async def run_test():
@@ -631,12 +775,29 @@ class TestAgenticExecutionQuality(unittest.TestCase):
                 yield {"message": {"role": "assistant", "content": next(responses)}, "done": True}
 
             with patch.object(agentic_module.worker, "generate_stream", mock_generate_stream):
-                return await plan_and_execute("Complete this request", model_name="test-model")
+                return await plan_and_execute("Do the planned work", model_name="test-model")
 
         result = asyncio.run(run_test())
-        self.assertIn("The provided data resolves the task.", result["content"])
-        self.assertIn("Here is the final answer.", result["content"])
-        self.assertNotIn("I cannot complete this step", result["content"])
+        self.assertIn("Final action done.", result["content"])
+
+    def test_parse_step_status_requires_terminal_explicit_token(self):
+        parse_status = agentic_module._parse_step_status
+        self.assertEqual(
+            parse_status("Useful output\nSTEP_FAILED: source unavailable"),
+            ("failed", "source unavailable", "Useful output"),
+        )
+        self.assertEqual(
+            parse_status("Useful output\n**STEP_PARTIAL: incomplete source**"),
+            ("partial", "incomplete source", "Useful output"),
+        )
+        self.assertEqual(
+            parse_status("I cannot finish this, but here is a result."),
+            ("success", "", "I cannot finish this, but here is a result."),
+        )
+        self.assertEqual(
+            parse_status("STEP_FAILED: not terminal\nMore output"),
+            ("success", "", "STEP_FAILED: not terminal\nMore output"),
+        )
 
     def test_agent_sampling_is_deterministic_and_request_options_are_isolated(self):
         captured_options = []
@@ -711,6 +872,49 @@ class TestAgenticExecutionQuality(unittest.TestCase):
         self.assertIn("New result", result["content"])
         self.assertIn("Later result", result["content"])
         self.assertNotIn("Earlier output must not be repeated", result["content"])
+        self.assertIsNone(agentic_module._get_session(session.session_id))
+
+    def test_resumed_step_retries_after_explicit_failure(self):
+        session = agentic_module.AgenticSession(
+            session_id="resume-retry-session",
+            prompt="Complete the task",
+            model_name="test-model",
+            plan_system_prompt="Plan",
+            execute_system_prompt="Execute",
+            max_steps=5,
+            tools=[],
+            steps=["First completed step", "Second step", "Final step"],
+            current_step_index=2,
+            step_outputs=["Earlier output"],
+            accumulated="Earlier output",
+            execute_messages=[{"role": "system", "content": "Execute"}],
+            pending_tool_calls=[],
+        )
+        agentic_module._save_session(session)
+        responses = iter([
+            "The resumed approach failed.\nSTEP_FAILED: missing detail",
+            "Recovered with the available context.",
+            "Final step completed.",
+            "Final answer.",
+        ])
+
+        async def run_test():
+            captured_messages = []
+
+            async def mock_generate_stream(stream=False, **kwargs):
+                captured_messages.append(kwargs.get("msg_history", []))
+                yield {"message": {"role": "assistant", "content": next(responses)}, "done": True}
+
+            with patch.object(agentic_module.worker, "generate_stream", mock_generate_stream):
+                result = await plan_and_execute(
+                    "ignored continuation prompt", model_name="test-model", session_id=session.session_id
+                )
+            return result, captured_messages
+
+        result, captured_messages = asyncio.run(run_test())
+        self.assertIn("Recovered with the available context.", result["content"])
+        self.assertIn("Final step completed.", result["content"])
+        self.assertIn("Previous attempt failed because missing detail", captured_messages[1][-1]["content"])
         self.assertIsNone(agentic_module._get_session(session.session_id))
 
     def test_tool_call_id_can_locate_a_resumable_session(self):

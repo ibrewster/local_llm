@@ -26,6 +26,7 @@ class TTSStreamer(spawn_context.Process):
         setproctitle.setproctitle("Hermes Speaker")
         self._packetizer = audio_stream.AudioPacketizer()
         logging.info("Loading Audio model")
+        self._audio_model =  load_model("nativ-community/phonon")
         self._audio_model = load_model("mlx-community/Kokoro-82M-bf16")
         # self._audio_model = load_model("mlx-community/orpheus-3b-0.1-ft-6bit")
         # self._audio_model = load_model("mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-6bit")

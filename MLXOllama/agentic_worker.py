@@ -55,8 +55,16 @@ Rules:
 - Do only the current step. Do not plan ahead or re-plan.
 - If tools are available, use them when needed.
 - Be concise but complete for this step.
-- If the step cannot be completed, say so clearly and stop.
+- If the step is a dead end, end your response with exactly `STEP_FAILED: <short reason>`.
+- If you made useful progress but could not fully complete the step, end with exactly `STEP_PARTIAL: <short reason>`.
+- Put the status token on the final non-empty line. Do not use either token for a completed step.
 - Do not invent information that is not in the previous outputs or tool results."""
+
+ON_TRACK_SYSTEM_PROMPT = """You are checking whether a multi-step plan is still appropriate.
+Given the original goal, completed outputs, and remaining plan, respond with exactly one of:
+ON_TRACK
+NEEDS_REPLAN: <short reason>
+Do not include any other text."""
 
 FINAL_ANSWER_PROMPT = """You are answering the user's original request.
 Use the outputs from the completed plan steps as evidence. Resolve them into one
@@ -65,6 +73,10 @@ unsupported information."""
 
 DEFAULT_MAX_TOKENS = 32768
 MAX_REPLANS = 2
+MAX_STEP_RETRIES = 1
+ON_TRACK_CHECK_INTERVAL = 3
+ON_TRACK_CONTEXT_CHARS = 16000
+ON_TRACK_MAX_TOKENS = 512
 SESSION_TTL_SECONDS = 1800
 
 
@@ -91,6 +103,11 @@ class AgenticSession:
     created_at: float = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
     replans_used: int = 0
+    step_attempt: int = 0
+    retry_reason: str = ""
+    retry_output: str = ""
+    steps_since_check: int = 0
+    context_chars_at_last_check: int = 0
 
 
 _active_sessions: dict[str, AgenticSession] = {}
@@ -247,26 +264,13 @@ async def _run_steps(
     """Execute the current and remaining steps, then synthesize a final answer."""
     delta_parts = [initial_output] if initial_output else []
     tools = session.tools
-    idx = session.current_step_index
-
-    while idx <= min(len(session.steps), session.max_steps):
+    while session.current_step_index <= min(len(session.steps), session.max_steps):
+        idx = session.current_step_index
         instruction = session.steps[idx - 1]
         if on_step_start is not None:
             await on_step_start(idx, instruction)
 
-        previous_context = "\n\n".join(
-            f"Step {i} output:\n{out}" for i, out in enumerate(session.step_outputs, start=1)
-        )
-        execute_user_content = (
-            f"Original request:\n{session.prompt}\n\n"
-            f"{'---' if previous_context else ''}"
-            f"{previous_context}\n\n---\n"
-            f"Execute this step:\n**Step {idx}: {instruction}**"
-        )
-        execute_messages = [
-            {"role": "system", "content": session.execute_system_prompt},
-            {"role": "user", "content": execute_user_content},
-        ]
+        execute_messages = _build_execute_messages(session, idx)
 
         logger.info("Executing step %d/%d: %s", idx, len(session.steps), instruction[:80])
         step_result = await _collect_completion(
@@ -288,24 +292,14 @@ async def _run_steps(
                 "session_id": session.session_id,
             }
 
-        if _is_step_failure(step_content) and session.replans_used < MAX_REPLANS:
-            revised_steps = await _replan_steps(
-                session, idx, step_content, model_info, options, on_token,
-            )
-            if revised_steps:
-                session.steps = session.steps[:idx - 1] + revised_steps
-                session.replans_used += 1
-                logger.info("Replanned remaining work after step %d failure", idx)
-                continue
-
-        step_block = f"\n\n--- Step {idx}: {instruction} ---\n{step_content}"
-        session.step_outputs.append(step_content)
-        session.accumulated += step_block
-        delta_parts.append(step_block)
-        if on_step is not None:
-            await on_step(idx, instruction, step_content)
-        idx += 1
-        session.current_step_index = idx
+        action, step_block = await _process_step_output(
+            session, idx, instruction, step_content, model_info, options,
+            on_step, on_token,
+        )
+        if step_block:
+            delta_parts.append(step_block)
+        if action in {"retry", "replanned"}:
+            continue
 
     previous_context = "\n\n".join(
         f"Step {i} output:\n{out}" for i, out in enumerate(session.step_outputs, start=1)
@@ -331,10 +325,104 @@ async def _run_steps(
     return {"content": "\n\n".join(part.strip() for part in delta_parts if part.strip())}
 
 
+def _build_execute_messages(session: AgenticSession, step_index: int) -> list[dict[str, Any]]:
+    previous_context = "\n\n".join(
+        f"Step {i} output:\n{out}" for i, out in enumerate(session.step_outputs, start=1)
+    )
+    execute_user_content = (
+        f"Original request:\n{session.prompt}\n\n"
+        f"{'---' if previous_context else ''}"
+        f"{previous_context}\n\n---\n"
+        f"Execute this step:\n**Step {step_index}: {session.steps[step_index - 1]}**\n\n"
+        "Outcome protocol: if this is a dead end, end with exactly "
+        "`STEP_FAILED: <short reason>`. If it produced useful but incomplete "
+        "information, end with exactly `STEP_PARTIAL: <short reason>`. "
+        "Otherwise do not add a status token."
+    )
+    if session.step_attempt > 0:
+        prior_output = session.retry_output.strip()
+        if len(prior_output) > 2000:
+            prior_output = prior_output[:2000] + "..."
+        execute_user_content += (
+            f"\n\nPrevious attempt failed because {session.retry_reason}. "
+            "Try a different approach for this same step."
+        )
+        if prior_output:
+            execute_user_content += f"\nPrevious attempt output:\n{prior_output}"
+    return [
+        {"role": "system", "content": session.execute_system_prompt},
+        {"role": "user", "content": execute_user_content},
+    ]
+
+
+async def _process_step_output(
+    session: AgenticSession,
+    step_index: int,
+    instruction: str,
+    step_content: str,
+    model_info: dict[str, Any],
+    options: dict[str, Any],
+    on_step: Optional[Callable[[int, str, str], Coroutine[Any, Any, None]]],
+    on_token: Optional[Callable[[str], Coroutine[Any, Any, None]]],
+) -> tuple[str, str]:
+    status, reason, body = _parse_step_status(step_content)
+    if status == "failed" and session.step_attempt < MAX_STEP_RETRIES:
+        session.step_attempt += 1
+        session.retry_reason = reason
+        session.retry_output = body or step_content
+        session.current_step_index = step_index
+        logger.info("Retrying step %d after explicit failure: %s", step_index, reason)
+        return "retry", ""
+
+    if status == "failed":
+        if session.replans_used < MAX_REPLANS:
+            problem = (
+                f"Step {step_index} ({instruction}) failed after {session.step_attempt + 1} attempt(s): "
+                f"{reason}\n\nLast attempt output:\n{body or '(no useful output)'}"
+            )
+            revised_steps = await _replan_steps(
+                session, step_index, problem, model_info, options, on_token,
+            )
+            if revised_steps:
+                session.steps = session.steps[:step_index - 1] + revised_steps
+                session.replans_used += 1
+                session.current_step_index = step_index
+                session.step_attempt = 0
+                session.retry_reason = ""
+                session.retry_output = ""
+                logger.info("Replanned remaining work after step %d failure", step_index)
+                return "replanned", ""
+        output = f"[Step failed: {reason}]"
+        if body:
+            output += f"\n{body}"
+    elif status == "partial":
+        output = f"[Partial result: {reason}]"
+        if body:
+            output += f"\n{body}"
+    else:
+        output = body
+
+    step_block = f"\n\n--- Step {step_index}: {instruction} ---\n{output}"
+    session.step_outputs.append(output)
+    session.accumulated += step_block
+    session.steps_since_check += 1
+    session.step_attempt = 0
+    session.retry_reason = ""
+    session.retry_output = ""
+    session.current_step_index = step_index + 1
+    if on_step is not None:
+        await on_step(step_index, instruction, output)
+
+    await _maybe_check_on_track(
+        session, session.current_step_index, model_info, options, on_token,
+    )
+    return "recorded", step_block
+
+
 async def _replan_steps(
     session: AgenticSession,
-    failed_step_index: int,
-    failure_output: str,
+    first_remaining_step_index: int,
+    problem_description: str,
     model_info: dict[str, Any],
     options: dict[str, Any],
     on_token: Optional[Callable[[str], Coroutine[Any, Any, None]]],
@@ -351,8 +439,9 @@ async def _replan_steps(
             "role": "user",
             "content": (
                 f"Original request:\n{session.prompt}\n\nCompleted steps and outputs:\n{completed}\n\n"
-                f"Step {failed_step_index} ({session.steps[failed_step_index - 1]}) could not be completed:\n"
-                f"{failure_output}\n\nProvide a revised numbered list of steps that can still satisfy the request."
+                f"Current remaining plan:\n{_format_remaining_steps(session.steps, first_remaining_step_index)}\n\n"
+                f"Issue requiring review:\n{problem_description}\n\n"
+                "Provide a revised numbered list of remaining steps that can still satisfy the request."
             ),
         },
     ]
@@ -363,12 +452,106 @@ async def _replan_steps(
     return _parse_steps(result.get("content", ""))
 
 
-def _is_step_failure(text: str) -> bool:
-    return bool(re.search(
-        r"\b(?:cannot|can't|unable to|could not|couldn't|not possible|failed to)\b",
-        text,
-        re.IGNORECASE,
-    ))
+def _format_remaining_steps(steps: list[str], first_step_index: int) -> str:
+    return "\n".join(
+        f"{index}. {step}"
+        for index, step in enumerate(steps[first_step_index - 1:], start=first_step_index)
+    ) or "(none)"
+
+
+def _parse_step_status(text: str) -> tuple[str, str, str]:
+    """Return the explicit step status, its reason, and response body."""
+    lines = text.splitlines()
+    last_index = next((index for index in range(len(lines) - 1, -1, -1) if lines[index].strip()), None)
+    if last_index is None:
+        return "success", "", ""
+
+    match = re.fullmatch(
+        r"\s*(?:`{1,3}\s*)?(?:\*\*)?(STEP_FAILED|STEP_PARTIAL):\s*(.+?)"
+        r"(?:\*\*)?\s*(?:`{1,3})?\s*",
+        lines[last_index],
+    )
+    if match is None:
+        return "success", "", text.strip()
+
+    status = "failed" if match.group(1) == "STEP_FAILED" else "partial"
+    body = "\n".join(lines[:last_index]).strip()
+    return status, match.group(2).strip(), body
+
+
+async def _maybe_check_on_track(
+    session: AgenticSession,
+    first_remaining_step_index: int,
+    model_info: dict[str, Any],
+    options: dict[str, Any],
+    on_token: Optional[Callable[[str], Coroutine[Any, Any, None]]],
+) -> bool:
+    if first_remaining_step_index > min(len(session.steps), session.max_steps):
+        return False
+    if session.replans_used >= MAX_REPLANS:
+        return False
+    context_chars = len(session.prompt) + len(session.accumulated)
+    interval_reached = session.steps_since_check >= ON_TRACK_CHECK_INTERVAL
+    context_reached = context_chars - session.context_chars_at_last_check >= ON_TRACK_CONTEXT_CHARS
+    if not interval_reached and not context_reached:
+        return False
+
+    session.steps_since_check = 0
+    session.context_chars_at_last_check = context_chars
+    status, reason = await _check_on_track(
+        session, first_remaining_step_index, model_info, options,
+    )
+    if status != "needs_replan":
+        return False
+
+    revised_steps = await _replan_steps(
+        session, first_remaining_step_index,
+        f"The current plan may no longer be appropriate: {reason}",
+        model_info, options, on_token,
+    )
+    if not revised_steps:
+        return False
+    session.steps = session.steps[:first_remaining_step_index - 1] + revised_steps
+    session.replans_used += 1
+    logger.info("Replanned remaining work after plan-health check: %s", reason)
+    return True
+
+
+async def _check_on_track(
+    session: AgenticSession,
+    first_remaining_step_index: int,
+    model_info: dict[str, Any],
+    options: dict[str, Any],
+) -> tuple[str, str]:
+    completed = "\n\n".join(
+        f"Step {index} output:\n{output}"
+        for index, output in enumerate(session.step_outputs, start=1)
+    ) or "(none)"
+    messages = [
+        {"role": "system", "content": ON_TRACK_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Original goal:\n{session.prompt}\n\nOutputs so far:\n{completed}\n\n"
+                f"Remaining plan:\n{_format_remaining_steps(session.steps, first_remaining_step_index)}"
+            ),
+        },
+    ]
+    check_options = dict(options)
+    check_options["max_tokens"] = ON_TRACK_MAX_TOKENS
+    check_options["temp"] = 0.1
+    result = await _collect_completion(
+        messages, model_info, check_options, tools=None, think=False, on_token=None,
+    )
+    lines = result.get("content", "").splitlines()
+    response = next((line.strip() for line in reversed(lines) if line.strip()), "")
+    if response == "ON_TRACK":
+        return "on_track", ""
+    match = re.fullmatch(r"NEEDS_REPLAN:\s*(.+?)\s*", response)
+    if match:
+        return "needs_replan", match.group(1).strip()
+    logger.warning("Ignoring unrecognized plan-health response: %s", response[:120])
+    return "on_track", ""
 
 
 async def _resume_session(
@@ -402,27 +585,14 @@ async def _resume_session(
         }
 
     step_content = result.get("content", "")
-    if _is_step_failure(step_content) and session.replans_used < MAX_REPLANS:
-        revised_steps = await _replan_steps(session, idx, step_content, model_info, options, on_token)
-        if revised_steps:
-            session.steps = session.steps[:idx - 1] + revised_steps
-            session.replans_used += 1
-            session.current_step_index = idx
-            return await _run_steps(
-                session, model_info, options, on_step,
-                on_step_start=on_step_start, on_token=on_token,
-            )
-
-    step_block = f"\n\n--- Step {idx}: {instruction} ---\n{step_content}"
-    session.step_outputs.append(step_content)
-    session.accumulated += step_block
-    if on_step is not None:
-        await on_step(idx, instruction, step_content)
-    session.current_step_index = idx + 1
+    action, step_block = await _process_step_output(
+        session, idx, instruction, step_content, model_info, options,
+        on_step, on_token,
+    )
     return await _run_steps(
         session, model_info, options, on_step,
         on_step_start=on_step_start, on_token=on_token,
-        initial_output=step_block,
+        initial_output=step_block if action == "recorded" else "",
     )
 
 
