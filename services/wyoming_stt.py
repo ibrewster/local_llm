@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import multiprocessing
-import os
+import re
 import resource
+import sys
 import threading
 import time
 
@@ -16,13 +17,9 @@ from wyoming.info import AsrModel, AsrProgram, Attribution, Describe, Info
 from wyoming.server import AsyncEventHandler, AsyncServer
 
 import MLXOllama # Sets HF_HOME config and initializes logging
+from MLXOllama.config import STT_MODEL
 
 URI = "tcp://0.0.0.0:10300"
-MODEL = "mlx-community/parakeet-tdt-0.6b-v2"
-#MODEL = "mlx-community/phonon-2"
-#MODEL = "littlebearlabs/parakeet-unified-en-0.6b-mlx-int8"  # Not yet supported by mlx_audio
-# Allows comparing models without editing this file (inherited by the spawned process)
-MODEL = os.environ.get("WYOMING_STT_MODEL", MODEL)
 LANGUAGE = "en"
 SAMPLE_RATE = 16000
 WARMUP_SECONDS = 3
@@ -97,6 +94,39 @@ class SttEventHandler(AsyncEventHandler):
         return result.text.strip()
 
 
+def _ensure_whisper_processor(model, model_name: str):
+    """mlx-community Whisper repos ship only weights + config, so mlx-audio can't build
+    its tokenizer and every transcription fails. Borrow it from the original openai repo.
+    """
+    if not hasattr(model, "_processor") or model._processor is not None:
+        return
+    from transformers import WhisperProcessor
+
+    # e.g. "whisper-small.en-mlx" -> "whisper-small.en"
+    base_name = re.sub(r"[-_](mlx|\d+bit|q\d+|fp16|4bit|8bit)$", "", model_name.split('/')[-1])
+    source = f"openai/{base_name}"
+    logging.info(f"Model has no tokenizer; loading WhisperProcessor from {source}")
+    model._processor = WhisperProcessor.from_pretrained(source)
+
+
+def _fix_english_only_whisper_no_speech():
+    """English-only Whisper models (*.en) have no <|nospeech|> token (they use <|nocaptions|>),
+    so mlx-audio's lookup falls back to <|endoftext|>. That id then lands in the suppress list,
+    which bans the end-of-text token and makes generation run on past the end of speech
+    (hallucinated trailing text). Mirror openai/whisper: prefer <|nospeech|>, else <|nocaptions|>.
+    """
+    from mlx_audio.stt.models.whisper.whisper import HFTokenizerWrapper
+
+    def no_speech(self):
+        vocab = self.hf_tokenizer.get_vocab()
+        for name in ("<|nospeech|>", "<|nocaptions|>"):
+            if name in vocab:
+                return vocab[name]
+        return None
+
+    HFTokenizerWrapper.no_speech = property(no_speech)
+
+
 def _warm_up(model):
     """Runs one throwaway transcription so the first real request doesn't pay for
     kernel compilation / lazy initialization (phonon-2 took ~1.7s cold vs ~0.04s warm).
@@ -115,12 +145,15 @@ def _warm_up(model):
     logging.info(f"Warm-up transcription took {time.monotonic() - start:.3f}s")
 
 
-async def _serve():
+async def _serve(model_name: str):
     from mlx_audio.stt import load
 
-    logging.info(f"Loading STT model: {MODEL}")
-    model = load(MODEL)
+    logging.info(f"Loading STT model: {model_name}")
+    model = load(model_name)
     logging.info("STT model loaded")
+    _ensure_whisper_processor(model, model_name)
+    if hasattr(model, "_processor"):
+        _fix_english_only_whisper_no_speech()
     _warm_up(model)
     _log_memory("after warm-up")
 
@@ -134,9 +167,9 @@ async def _serve():
                 version="0.1.0",
                 models=[
                     AsrModel(
-                        name=MODEL,
-                        description=f"mlx-audio STT ({MODEL})",
-                        attribution=Attribution(name="MLX Community", url=f"https://huggingface.co/{MODEL}"),
+                        name=model_name,
+                        description=f"mlx-audio STT ({model_name})",
+                        attribution=Attribution(name="MLX Community", url=f"https://huggingface.co/{model_name}"),
                         installed=True,
                         languages=[LANGUAGE],
                         version="0.1.0",
@@ -151,19 +184,21 @@ async def _serve():
     await server.run(partial(SttEventHandler, info, model))
 
 
-def _run_wyoming_stt():
+def _run_wyoming_stt(model_name: str):
     import setproctitle
 
     setproctitle.setproctitle("Hermes Listener")
     threading.current_thread().name = 'HERMES_LISTENER_MAIN'
 
-    asyncio.run(_serve())
+    asyncio.run(_serve(model_name))
 
 
-def start_wyoming_stt_process():
+def start_wyoming_stt_process(model: str | None = None):
+    """Starts the STT server in a child process. `model` defaults to config.STT_MODEL."""
     spawn_context = multiprocessing.get_context('spawn')
     stt_process = spawn_context.Process(
         target=_run_wyoming_stt,
+        args=(model or STT_MODEL,),
         daemon=True,
         name="Hermes Listener"
     )
@@ -173,8 +208,8 @@ def start_wyoming_stt_process():
 
 
 if __name__ == "__main__":
-    # Standalone: python -m services.wyoming_stt  (run from the project root)
+    # Standalone: python -m services.wyoming_stt [model]  (run from the project root)
     try:
-        _run_wyoming_stt()
+        _run_wyoming_stt(sys.argv[1] if len(sys.argv) > 1 else STT_MODEL)
     except KeyboardInterrupt:
         pass
