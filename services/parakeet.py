@@ -20,6 +20,7 @@ def _run_parakeet():
 
     URI = "tcp://0.0.0.0:10300"
     MODEL = "mlx-community/parakeet-tdt-0.6b-v2"
+    #MODEL = "littlebearlabs/parakeet-unified-en-0.6b-mlx-int8"
 
     logging.info(f"Starting Parakeet process from {parakeet_path}")
     sys.argv = [
@@ -44,3 +45,10 @@ def start_parakeet_process():
     parakeet_process.start()
 
     return parakeet_process
+
+if __name__ == "__main__":
+    # Standalone: python -m services.parakeet  (run from the project root)
+    try:
+        _run_parakeet()
+    except KeyboardInterrupt:
+        pass

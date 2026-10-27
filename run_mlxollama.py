@@ -15,7 +15,7 @@ from hypercorn.asyncio import serve
 import MLXOllama # Sets the HF_HOME config
 from MLXOllama import tts_streamer
 
-from services import parakeet, litellm_runner
+from services import wyoming_stt, litellm_runner
 
 def _sigterm_handler(_signum, _frame):
     os.kill(os.getpid(), signal.SIGINT)
@@ -24,9 +24,9 @@ signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
 if __name__ == "__main__":    
-    logging.info("Starting Parakeet Server")
-    parakeet_process=parakeet.start_parakeet_process()
-    logging.info("Parakeet process PID: %d", parakeet_process.pid)
+    logging.info("Starting Wyoming STT Server")
+    stt_process=wyoming_stt.start_wyoming_stt_process()
+    logging.info("Wyoming STT process PID: %d", stt_process.pid)
     
     logging.info("Starting TTS process")
     MLXOllama.tts_queue = multiprocessing.Queue()
@@ -58,7 +58,7 @@ if __name__ == "__main__":
     MLXOllama.process_thread.join()
     
     for name, process in [
-        ("Parakeet", parakeet_process),
+        ("Wyoming STT", stt_process),
         ("Speaker", tts_process),
 #        ("litellm", litellm_process),
     ]:

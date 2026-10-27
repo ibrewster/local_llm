@@ -71,3 +71,10 @@ def run_whisper_process():
         )
         
     asyncio.run(main())
+
+if __name__ == "__main__":
+    # Standalone: python -m services.whisper  (run from the project root)
+    try:
+        run_whisper_process()
+    except KeyboardInterrupt:
+        pass

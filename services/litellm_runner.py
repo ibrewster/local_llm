@@ -56,3 +56,11 @@ def start_litellm_process():
     litellm_process.start()
 
     return litellm_process
+
+if __name__ == "__main__":
+    # Standalone: python -m services.litellm_runner  (run from the project root)
+    # Goes through start_litellm_process() so the YAML config gets generated first.
+    try:
+        start_litellm_process().join()
+    except KeyboardInterrupt:
+        pass

@@ -31,3 +31,4 @@ diskcache
 pyyaml
 litellm
 litellm[proxy]
+wyoming
