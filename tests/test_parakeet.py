@@ -1,9 +1,17 @@
-"""Integration test for the Wyoming Parakeet ASR server (services/parakeet.py).
+"""Integration test for the Wyoming ASR server (services/wyoming_stt.py, any model).
 
-Requires the server to be running on localhost:10300. The test is skipped if
+Requires the server to be running (default localhost:10300). The tests are skipped if
 the port is not reachable. It streams a known recording
 (tests/data/quick_brown_fox.wav) using the Wyoming protocol and verifies
 that the transcript matches the spoken sentence.
+
+Environment variables (all optional):
+    STT_HOST          server host (default 127.0.0.1), e.g. 10.27.81.2 for a remote machine
+    STT_PORT          server port (default 10300)
+    STT_SSH           ssh target (e.g. user@10.27.81.2) used to measure the *remote* server's
+                      memory; without it, memory is only reported for a local server
+    STT_EXPECT_MODEL  substring the server must advertise, e.g. whisper-small.en-mlx
+    PARAKEET_RUNS     number of repeated transcriptions in the timing test (default 3)
 
 Regenerate the fixture (macOS) with:
     say -v Samantha -o /tmp/p.aiff "The quick brown fox jumps over the lazy dog."
@@ -12,6 +20,7 @@ Regenerate the fixture (macOS) with:
 import asyncio
 import os
 import re
+import shlex
 import socket
 import statistics
 import subprocess
@@ -26,8 +35,11 @@ from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.client import AsyncTcpClient
 from wyoming.info import Describe, Info
 
-HOST = "127.0.0.1"
-PORT = 10300
+HOST = os.environ.get("STT_HOST", "127.0.0.1")
+PORT = int(os.environ.get("STT_PORT", "10300"))
+SSH_TARGET = os.environ.get("STT_SSH")
+EXPECT_MODEL = os.environ.get("STT_EXPECT_MODEL")
+IS_LOCAL = HOST in ("127.0.0.1", "localhost", "::1")
 AUDIO_FILE = Path(__file__).parent / "data" / "quick_brown_fox.wav"
 EXPECTED_TEXT = "The quick brown fox jumps over the lazy dog."
 SAMPLES_PER_CHUNK = 1024
@@ -51,24 +63,30 @@ class Timing:
 
 def _server_available() -> bool:
     try:
-        with socket.create_connection((HOST, PORT), timeout=1):
+        with socket.create_connection((HOST, PORT), timeout=5):
             return True
     except OSError:
         return False
 
 
 pytestmark = pytest.mark.skipif(
-    not _server_available(), reason=f"Parakeet server not running on {HOST}:{PORT}"
+    not _server_available(), reason=f"STT server not running on {HOST}:{PORT}"
 )
+
+
+def _run_on_server_host(cmd: list[str], timeout: int) -> str:
+    """Runs a command on the machine hosting the server (locally, or via ssh for a remote one)."""
+    if not IS_LOCAL:
+        if not SSH_TARGET:
+            raise OSError("remote server and STT_SSH not set")
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", SSH_TARGET, shlex.join(cmd)]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
 
 
 def _server_pid() -> int | None:
     """PID of the process listening on PORT (the model lives in that process)."""
     try:
-        out = subprocess.run(
-            ["lsof", f"-iTCP:{PORT}", "-sTCP:LISTEN", "-t"],
-            capture_output=True, text=True, timeout=10,
-        ).stdout.split()
+        out = _run_on_server_host(["lsof", f"-iTCP:{PORT}", "-sTCP:LISTEN", "-t"], 20).split()
         return int(out[0]) if out else None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
@@ -85,14 +103,10 @@ def _server_memory_mb() -> dict[str, float]:
         return {}
     mem: dict[str, float] = {}
     try:
-        rss_kb = subprocess.run(
-            ["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True, timeout=10
-        ).stdout.strip()
+        rss_kb = _run_on_server_host(["ps", "-o", "rss=", "-p", str(pid)], 20).strip()
         if rss_kb:
             mem["rss"] = int(rss_kb) / 1024
-        out = subprocess.run(
-            ["footprint", "-p", str(pid)], capture_output=True, text=True, timeout=30
-        ).stdout
+        out = _run_on_server_host(["footprint", "-p", str(pid)], 40)
         for key in ("phys_footprint", "phys_footprint_peak"):
             match = re.search(rf"{key}:\s+([\d.]+)\s*(KB|MB|GB)", out)
             if match:
@@ -186,6 +200,25 @@ async def _transcribe(wav_path: Path) -> tuple[str, Timing]:
                     total_seconds=done - start,
                 )
                 return Transcript.from_event(event).text, timing
+
+
+async def _describe() -> Info:
+    async with AsyncTcpClient(HOST, PORT) as client:
+        await client.write_event(Describe().event())
+        while True:
+            event = await client.read_event()
+            assert event is not None
+            if Info.is_type(event.type):
+                return Info.from_event(event)
+
+
+@pytest.mark.skipif(not EXPECT_MODEL, reason="STT_EXPECT_MODEL not set")
+def test_server_runs_expected_model():
+    """Guards against benchmarking the wrong model (e.g. a stale server on the remote box)."""
+    info = asyncio.run(asyncio.wait_for(_describe(), TIMEOUT))
+    names = [m.name for program in info.asr for m in program.models]
+    print(f"Server {HOST}:{PORT} advertises models: {names}")
+    assert any(EXPECT_MODEL in name for name in names), f"{EXPECT_MODEL!r} not in {names}"
 
 
 def test_describe_returns_info():
