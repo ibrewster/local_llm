@@ -3,13 +3,14 @@ import base64
 import json
 import logging
 import random
+import re
 import time
 import uuid
 from typing import Any, Mapping, cast
 
 import quart
 
-from . import app, config, utils, worker
+from . import app, config, image_generation, utils, worker
 from .common import images_from_messages, read_chat_request
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,56 @@ def _chunk(
         "model": model_name,
         "choices": [choice],
     }
+
+
+@app.route("/v1/images/generations", methods=["POST"])
+async def image_generations() -> Any:
+    """Generate an image and return it in the OpenAI Images API format."""
+    data = await quart.request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _error("Request body must be a JSON object")
+
+    prompt = data.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return _error("'prompt' is required and must be a non-empty string")
+
+    count = data.get("n", 1)
+    if not isinstance(count, int) or isinstance(count, bool) or count != 1:
+        return _error("Only one image per request is supported")
+    response_format = data.get("response_format", "b64_json")
+    if response_format != "b64_json":
+        return _error("Only 'b64_json' response_format is supported")
+    seed = data.get("seed")
+    if seed is not None and (
+        not isinstance(seed, int) or isinstance(seed, bool) or seed < 0
+    ):
+        return _error("'seed' must be a non-negative integer")
+
+    size = data.get("size", "1024x1024")
+    size_match = re.fullmatch(r"(\d+)x(\d+)", size) if isinstance(size, str) else None
+    if size_match is None:
+        return _error("'size' must be specified as WIDTHxHEIGHT")
+    width, height = (int(value) for value in size_match.groups())
+    if any(dimension < 256 or dimension > 2048 or dimension % 16 for dimension in (width, height)):
+        return _error("Image dimensions must be between 256 and 2048 and divisible by 16")
+
+    try:
+        image_bytes = await image_generation.generate_image(
+            prompt.strip(),
+            seed=seed,
+            width=width,
+            height=height,
+        )
+    except image_generation.ImageModelUnavailableError as exc:
+        return _error(str(exc), 404, "model_not_found")
+    except Exception:
+        logger.exception("Image generation failed")
+        return _error("Image generation failed", 500, "server_error")
+
+    return quart.jsonify({
+        "created": int(time.time()),
+        "data": [{"b64_json": base64.b64encode(image_bytes).decode("ascii")}],
+    })
 
 
 @app.route("/v1/chat/completions", methods=["POST"])

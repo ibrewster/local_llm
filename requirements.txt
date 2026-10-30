@@ -9,6 +9,7 @@ aiocache
 mlx
 mlx-audio
 mlx-vlm
+mflux
 Pillow
 sounddevice
 soundfile
