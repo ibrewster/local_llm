@@ -454,7 +454,7 @@ async def build_standard_mcp_tools() -> List[Dict]:
             "function": {
                 "name": tool.name,
                 "description": tool.description or "",
-                "parameters": tool.inputSchema,
+                "parameters": tool.input_schema,
             },
         }
         for tool in raw
