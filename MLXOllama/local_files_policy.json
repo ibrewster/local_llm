@@ -1,0 +1,13 @@
+{
+  "include": [
+    ".",
+    "/Users/israel/Documents",
+    "/Users/israel/Desktop",
+    "/Users/israel/Downloads",
+    "/Users/israel/Pictures",
+    "/Users/israel/Videos",
+    "/Users/israel/Development"
+  ],
+  "deny": [],
+  "sensitive": []
+}

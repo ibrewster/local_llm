@@ -776,7 +776,10 @@ async def agentic_completions():
     max_steps = data.get("max_steps", 20)
     max_tokens = data.get("max_completion_tokens", data.get("max_tokens", DEFAULT_MAX_TOKENS))
     thinking = data.get("think", True)
-    tools = data.get("tools") or None
+    tools = utils.merge_local_tools(
+        data.get("tools") or None,
+        include=["local_tools"],
+    )
 
     is_continuation = _has_tool_results(messages)
     session_id = _extract_session_id(data)

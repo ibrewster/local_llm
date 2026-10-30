@@ -1,9 +1,13 @@
 import json
 import inspect
 import logging
+import fnmatch
+import os
 import re
 import types
 import time
+import stat
+from pathlib import Path
 
 from datetime import datetime, timedelta, date
 from enum import Enum
@@ -31,6 +35,190 @@ from .async_ttl_cache import async_ttl_cache
 from .config import BRAVE_SEARCH_API_KEY
 
 LOCAL_TOOLS = {}
+
+MAX_LOCAL_FILE_READ_BYTES = 1_048_576
+MAX_LOCAL_FILE_WRITE_BYTES = 1_048_576
+MAX_LOCAL_DIRECTORY_ENTRIES = 500
+
+SENSITIVE_LOCAL_FILE_PATTERNS = (
+    ".env",
+    ".env.*",
+    ".git-credentials",
+    ".netrc",
+    ".npmrc",
+    ".ssh",
+    "id_rsa",
+    "id_rsa.*",
+    "id_ed25519",
+    "id_ed25519.*",
+    "id_ecdsa",
+    "id_ecdsa.*",
+    "id_dsa",
+    "id_dsa.*",
+    "authorized_keys",
+    "*.pem",
+    "*.key",
+    "*.p8",
+    "*.p12",
+    "*.pfx",
+    "*.jks",
+    "credentials",
+    "credentials.*",
+    "application_default_credentials.json",
+    "secrets.json",
+)
+
+
+def _local_files_root() -> Path:
+    root = Path(getattr(config, "LOCAL_FILES_ROOT", os.getcwd())).expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise NotADirectoryError(f"Local files root is not a directory: {root}")
+    return root
+
+
+def _local_file_policy() -> dict[str, list[str]]:
+    """Load the sibling policy JSON (or LOCAL_FILES_POLICY_PATH) per tool call.
+
+    Include entries are directory roots; relative deny globs apply across roots.
+    Built-in sensitive-file patterns cannot be removed.
+    """
+    configured_policy_path = os.environ.get("LOCAL_FILES_POLICY_PATH") or getattr(
+        config, "LOCAL_FILES_POLICY_PATH", None
+    )
+    policy_path = Path(
+        configured_policy_path or Path(__file__).with_name("local_files_policy.json")
+    ).expanduser()
+    if not policy_path.exists():
+        if configured_policy_path is not None:
+            raise FileNotFoundError(f"Local file policy does not exist: {policy_path}")
+        return {
+            "include": [str(_local_files_root())],
+            "deny": [],
+            "sensitive": [],
+        }
+
+    with policy_path.open(encoding="utf-8") as policy_file:
+        policy = json.load(policy_file)
+    if not isinstance(policy, dict) or set(policy) - {"include", "deny", "sensitive"}:
+        raise ValueError(
+            "local file policy must be an object containing only include, deny, and sensitive"
+        )
+
+    normalized = {}
+    for key in ("include", "deny", "sensitive"):
+        value = policy.get(key, [])
+        if not isinstance(value, list) or not all(
+            isinstance(rule, str) and rule for rule in value
+        ):
+            raise ValueError(f"local file policy '{key}' must be a list of non-empty strings")
+        normalized[key] = value
+    if not normalized["include"]:
+        raise ValueError("local file policy 'include' must contain at least one path")
+    return normalized
+
+
+def _absolute_policy_rule(rule: str, base: Path) -> str:
+    rule_path = Path(rule).expanduser()
+    if not rule_path.is_absolute():
+        rule_path = base / rule_path
+    if any(character in os.fspath(rule_path) for character in "*?["):
+        return os.path.abspath(os.fspath(rule_path))
+    return os.fspath(rule_path.resolve(strict=False))
+
+
+def _path_matches_rule(
+    path: Path,
+    rule: str,
+    base: Path,
+    *,
+    match_relative_anywhere: bool = False,
+) -> bool:
+    rule_path = Path(rule).expanduser()
+    if match_relative_anywhere and not rule_path.is_absolute():
+        rule_text = rule.replace(os.sep, "/")
+        path_parts = path.parts[1:] if path.is_absolute() else path.parts
+        suffixes = ["/".join(path_parts[index:]) for index in range(len(path_parts))]
+        if any(character in rule_text for character in "*?["):
+            return any(fnmatch.fnmatchcase(suffix, rule_text) for suffix in suffixes)
+        return any(
+            suffix == rule_text or suffix.startswith(rule_text.rstrip("/") + "/")
+            for suffix in suffixes
+        )
+
+    path_text = os.fspath(path)
+    rule_text = _absolute_policy_rule(rule, base)
+    if any(character in rule_text for character in "*?["):
+        return fnmatch.fnmatchcase(path_text, rule_text)
+    return path_text == rule_text or path_text.startswith(rule_text.rstrip(os.sep) + os.sep)
+
+
+def _is_sensitive_path(path: Path, policy: dict[str, list[str]], base: Path) -> bool:
+    for rule in (*SENSITIVE_LOCAL_FILE_PATTERNS, *policy["sensitive"]):
+        if "/" in rule or os.path.isabs(rule):
+            if _path_matches_rule(
+                path, rule, base, match_relative_anywhere=not os.path.isabs(rule)
+            ):
+                return True
+        elif any(fnmatch.fnmatchcase(part.lower(), rule.lower()) for part in path.parts):
+            return True
+    return False
+
+
+def _check_local_file_access(
+    path: str | Path,
+    *,
+    action: str,
+    must_exist: bool,
+    policy: dict[str, list[str]] | None = None,
+) -> tuple[Path, Path]:
+    """Resolve and authorize a file path; all local file tools use this check."""
+    if not isinstance(path, (str, Path)) or not os.fspath(path):
+        raise ValueError("path must be a non-empty path")
+    base = _local_files_root()
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    requested_path = Path(os.path.abspath(os.fspath(candidate)))
+    resolved = candidate.resolve(strict=must_exist)
+    policy = policy if policy is not None else _local_file_policy()
+
+    for checked_path in {requested_path, resolved}:
+        if _is_sensitive_path(checked_path, policy, base):
+            raise PermissionError(f"{action} of sensitive local file is blocked: {path}")
+        if any(
+            _path_matches_rule(
+                checked_path, rule, base, match_relative_anywhere=True
+            )
+            for rule in policy["deny"]
+        ):
+            raise PermissionError(f"{action} of local path is denied: {path}")
+    if not any(_path_matches_rule(resolved, rule, base) for rule in policy["include"]):
+        raise PermissionError(f"{action} of local path is not included: {path}")
+    return base, resolved
+
+
+def _included_search_roots(
+    policy: dict[str, list[str]] | None = None,
+) -> list[Path]:
+    base = _local_files_root()
+    policy = policy if policy is not None else _local_file_policy()
+    roots = []
+    seen = set()
+    for rule in policy["include"]:
+        if any(character in rule for character in "*?["):
+            continue
+        root = Path(_absolute_policy_rule(rule, base)).resolve(strict=False)
+        if root.is_dir() and os.fspath(root) not in seen:
+            try:
+                _check_local_file_access(
+                    root, action="search", must_exist=True, policy=policy
+                )
+            except PermissionError:
+                continue
+            roots.append(root)
+            seen.add(os.fspath(root))
+    return roots
+
 
 ###################### UTILITY FUNCTIONS/DECORATORS ############################
 def _json_schema(annotation: Any) -> dict[str, Any]:
@@ -333,6 +521,224 @@ def local_tool(func):
     return func
 
 ############################ TOOLS #############################
+@local_tool
+async def find_local_files(
+    name_pattern: str,
+    max_depth: int = 5,
+    max_results: int = 50,
+) -> str:
+    """Find files by filename pattern inside the configured local files workspace.
+
+    The pattern is matched against each file's name using glob syntax (for example,
+    "*.py" or "notes-*.txt"). Results under LOCAL_FILES_ROOT are relative;
+    results from other included roots are absolute. Search does not follow
+    directory symlinks and has bounded depth and result count.
+
+    PARAMETERS
+    ----------
+    name_pattern (str): Glob pattern matched against file names.
+    max_depth (int): Maximum directory depth to search, from 0 to 10. The root is depth 0.
+    max_results (int): Maximum matching files to return, from 1 to 100.
+    """
+    if not isinstance(name_pattern, str) or not name_pattern:
+        raise ValueError("name_pattern must be a non-empty glob pattern")
+    if not 0 <= max_depth <= 10:
+        raise ValueError("max_depth must be between 0 and 10")
+    if not 1 <= max_results <= 100:
+        raise ValueError("max_results must be between 1 and 100")
+
+    matches = []
+    truncated = False
+    seen_files = set()
+    base = _local_files_root()
+    policy = _local_file_policy()
+    for root in _included_search_roots(policy):
+        for current, dirs, files in os.walk(root, followlinks=False):
+            current_path = Path(current)
+            depth = len(current_path.relative_to(root).parts)
+            dirs[:] = [
+                directory for directory in dirs
+                if not (current_path / directory).is_symlink()
+            ]
+            allowed_dirs = []
+            for directory in dirs:
+                try:
+                    _check_local_file_access(
+                        current_path / directory,
+                        action="search",
+                        must_exist=True,
+                        policy=policy,
+                    )
+                except PermissionError:
+                    continue
+                allowed_dirs.append(directory)
+            dirs[:] = allowed_dirs
+            if depth >= max_depth:
+                dirs.clear()
+            for filename in files:
+                if not fnmatch.fnmatchcase(filename, name_pattern):
+                    continue
+                file_path = current_path / filename
+                try:
+                    _, resolved_path = _check_local_file_access(
+                        file_path, action="search", must_exist=True, policy=policy
+                    )
+                    info = file_path.stat(follow_symlinks=False)
+                except (FileNotFoundError, PermissionError):
+                    continue
+                if not stat.S_ISREG(info.st_mode) or resolved_path in seen_files:
+                    continue
+                if len(matches) == max_results:
+                    truncated = True
+                    break
+                seen_files.add(resolved_path)
+                try:
+                    display_path = resolved_path.relative_to(base).as_posix()
+                except ValueError:
+                    display_path = str(resolved_path)
+                matches.append({
+                    "path": display_path,
+                    "size_bytes": info.st_size,
+                })
+            if truncated:
+                break
+        if truncated:
+            break
+    return json.dumps({"matches": matches, "truncated": truncated})
+
+
+@local_tool
+async def list_local_directory(path: str = ".", max_entries: int = 100) -> str:
+    """List the immediate contents of an included local directory.
+
+    Paths may be relative to LOCAL_FILES_ROOT or absolute when included by policy.
+    Results are limited to at most 500 entries.
+
+    PARAMETERS
+    ----------
+    path (str): Directory path relative to the default root or an included absolute path.
+    max_entries (int): Maximum number of entries to return, from 1 to 500.
+    """
+    if not 1 <= max_entries <= MAX_LOCAL_DIRECTORY_ENTRIES:
+        raise ValueError(f"max_entries must be between 1 and {MAX_LOCAL_DIRECTORY_ENTRIES}")
+
+    policy = _local_file_policy()
+    _, directory = _check_local_file_access(
+        path, action="list", must_exist=True, policy=policy
+    )
+    if not directory.is_dir():
+        raise NotADirectoryError(f"Not a directory: {path}")
+
+    entries = []
+    truncated = False
+    for entry in directory.iterdir():
+        try:
+            _check_local_file_access(
+                entry, action="list", must_exist=False, policy=policy
+            )
+            info = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                entry_type = "symlink"
+            elif stat.S_ISDIR(info.st_mode):
+                entry_type = "directory"
+            elif stat.S_ISREG(info.st_mode):
+                entry_type = "file"
+            else:
+                entry_type = "other"
+            item = {"name": entry.name, "type": entry_type}
+            if entry_type == "file":
+                item["size_bytes"] = info.st_size
+            if len(entries) == max_entries:
+                truncated = True
+                break
+            entries.append(item)
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            continue
+
+    return json.dumps({
+        "path": path,
+        "entries": entries,
+        "truncated": truncated,
+    })
+
+
+@local_tool
+async def read_local_file(path: str, max_bytes: int = 262_144) -> str:
+    """Read an included UTF-8 text file.
+
+    Paths may be relative to LOCAL_FILES_ROOT or absolute when included by policy.
+    Files larger than the requested limit are rejected; reads are capped at 1 MiB.
+
+    PARAMETERS
+    ----------
+    path (str): File path relative to the default root or an included absolute path.
+    max_bytes (int): Maximum file size to read, from 1 to 1048576 bytes.
+    """
+    if not 1 <= max_bytes <= MAX_LOCAL_FILE_READ_BYTES:
+        raise ValueError(f"max_bytes must be between 1 and {MAX_LOCAL_FILE_READ_BYTES}")
+    _, file_path = _check_local_file_access(
+        path, action="read", must_exist=True, policy=_local_file_policy()
+    )
+    file_descriptor = os.open(file_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(file_descriptor, "rb") as file:
+        info = os.fstat(file.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("path must refer to a regular file")
+        if info.st_size > max_bytes:
+            raise ValueError(f"file exceeds the {max_bytes}-byte read limit")
+        content = file.read(max_bytes + 1)
+    if len(content) > max_bytes:
+        raise ValueError(f"file exceeds the {max_bytes}-byte read limit")
+    return content.decode("utf-8")
+
+
+@local_tool
+async def write_local_file(path: str, content: str) -> str:
+    """Create a new UTF-8 text file at an included path.
+
+    Paths may be relative to LOCAL_FILES_ROOT or absolute when included by policy.
+    Existing files are never overwritten, parent directories must already exist, and content
+    is limited to 1 MiB.
+
+    PARAMETERS
+    ----------
+    path (str): Destination path relative to the default root or an included absolute path.
+    content (str): Text to write to the new file.
+    """
+    if not isinstance(content, str):
+        raise ValueError("content must be a string")
+    data = content.encode("utf-8")
+    if len(data) > MAX_LOCAL_FILE_WRITE_BYTES:
+        raise ValueError(f"content exceeds the {MAX_LOCAL_FILE_WRITE_BYTES}-byte write limit")
+
+    relative = Path(path).expanduser() if isinstance(path, str) else None
+    if relative is None or not path or relative.name in {"", ".", ".."}:
+        raise ValueError("path must be a file path")
+    base = _local_files_root()
+    destination_path = relative if relative.is_absolute() else base / relative
+    parent = destination_path.parent.resolve(strict=True)
+    if not parent.is_dir():
+        raise NotADirectoryError(f"Parent directory does not exist: {relative.parent}")
+
+    _, destination = _check_local_file_access(
+        destination_path,
+        action="write",
+        must_exist=False,
+        policy=_local_file_policy(),
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    file_descriptor = os.open(destination, flags, 0o600)
+    try:
+        with os.fdopen(file_descriptor, "wb") as file:
+            file.write(data)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    return f"Created {path} ({len(data)} bytes)"
+
+
 @local_tool
 async def get_current_time(timezone: str | None = None) -> str:
     """

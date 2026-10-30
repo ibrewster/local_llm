@@ -91,7 +91,13 @@ class SttEventHandler(AsyncEventHandler):
         logging.debug(f"Transcription took {time.monotonic() - start:.3f}s")
         _log_memory("after transcription")
 
-        return result.text.strip()
+        text = result.text.strip()
+        words = text.split()
+        if len(words) > 10 and len(set(words)) / len(words) < 0.1:
+            logging.warning("Repetition loop detected, suppressing: %s", text[:80])
+            return ""
+
+        return text
 
 
 def _ensure_whisper_processor(model, model_name: str):

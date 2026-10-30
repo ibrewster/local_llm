@@ -482,17 +482,30 @@ async def mcp_tools_refresh_loop():
 
 def merge_local_tools(
     tools: Optional[List[Dict]],
+    include: Optional[List[str]] = None,
 ) -> Optional[List[Dict]]:
-    """Merge server-side standard tools into the client-provided tools list.
+    """Merge selected server-side tools into the client-provided tools list.
 
-    Merges both ``STANDARD_MCP_TOOLS`` (pre-computed MCP tools) and
-    ``local_tools.LOCAL_TOOLS``.  When the client already supplied a
-    tools list, duplicates are skipped by tool name so the client's
-    version takes precedence.
+    ``include`` selects from ``"STANDARD_MCP_TOOLS"`` and ``"local_tools"``.
+    By default, both are included to preserve the existing behavior. When the
+    client already supplied a tools list, duplicates are skipped by tool name
+    so the client's version takes precedence.
 
     Returns a new list (or ``None`` when no tools are involved).
     """
-    all_server_tools = STANDARD_MCP_TOOLS + list(local_tools.LOCAL_TOOLS.values())
+    available_tools = {
+        "STANDARD_MCP_TOOLS": STANDARD_MCP_TOOLS,
+        "local_tools": list(local_tools.LOCAL_TOOLS.values()),
+    }
+    if include is None:
+        include = ["STANDARD_MCP_TOOLS", "local_tools"]
+    unknown_includes = set(include) - available_tools.keys()
+    if unknown_includes:
+        sources = ", ".join(sorted(unknown_includes))
+        raise ValueError(f"Unknown tool source(s): {sources}")
+    all_server_tools = [
+        schema for source in include for schema in available_tools[source]
+    ]
 
     if tools is None:
         return list(all_server_tools)
