@@ -1033,7 +1033,7 @@ async def try_server_tools(tool_calls: list) -> tuple[list[dict], list[dict]]:
             # MCP tool — if the name isn't in the known tools list, it's likely a
             # dynamic HA-MCP tool, so prepend the HA-MCP prefix for routing.
             mcp_name = tool_name
-            if tool_name not in utils.MCP_CLIENT.available_tools:
+            if tool_name not in utils.MCP_CLIENT.available_tools and not tool_name.startswith("HA-MCP_"):
                 mcp_name = f"HA-MCP_{tool_name}"
                 logging.info(f"  Tool '{tool_name}' not in available_tools — trying as '{mcp_name}'")
 
