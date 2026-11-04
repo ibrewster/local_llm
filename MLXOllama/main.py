@@ -9,7 +9,7 @@ import quart
 import sounddevice as sd
 import soundfile as sf
 
-from . import app, speak_queue, config, utils, worker, cache_utils
+from . import app, speak_queue, config, utils, worker, cache_utils, mcp_client
 from .common import images_from_messages, message_text, read_chat_request
 assert app is not None #because we couldn't be here if it was
 
@@ -196,7 +196,7 @@ async def api_chat():
 
     include_local = quart.request.headers.get("X-Include-Local-Tools", "false").lower() == "true"
     if include_local:
-        tools = utils.merge_local_tools(tools)
+        tools = mcp_client.merge_local_tools(tools)
 
     model_info = utils.loaded_models[model_name]
     
@@ -356,14 +356,14 @@ _whisper_process: multiprocessing.Process | None = None
 async def startup():
     global _whisper_process
     
-    await utils.MCP_CLIENT.get_client() # ensures it is connected.
+    await mcp_client.MCP_CLIENT.get_client() # ensures it is connected.
     
     # Prime the MCP tools list immediately, then start background refresh
-    utils.STANDARD_MCP_TOOLS = await utils.build_standard_mcp_tools()
-    logging.info(f"Loaded {len(utils.STANDARD_MCP_TOOLS)} standard MCP tools")
+    mcp_client.STANDARD_MCP_TOOLS = await mcp_client.build_standard_mcp_tools()
+    logging.info(f"Loaded {len(mcp_client.STANDARD_MCP_TOOLS)} standard MCP tools")
     
     asyncio.create_task(
-        utils.mcp_tools_refresh_loop(),
+        mcp_client.mcp_tools_refresh_loop(),
         name="MCP_Tools_Refresh"
     )
     
@@ -387,7 +387,7 @@ async def startup():
 @app.after_serving
 async def shutdown():
     """Triggered once when the server stops."""
-    await utils.MCP_CLIENT.close()
+    await mcp_client.MCP_CLIENT.close()
 
 
 # Import after this module has finished defining the Ollama routes so the

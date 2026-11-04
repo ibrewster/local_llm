@@ -20,7 +20,7 @@ from typing import Any, Callable, Coroutine, Optional
 
 import quart
 
-from . import app, config, utils, worker
+from . import app, config, utils, worker, mcp_client
 from .common import message_text, read_chat_request
 from .openai import _format_tool_calls
 
@@ -776,7 +776,7 @@ async def agentic_completions():
     max_steps = data.get("max_steps", 20)
     max_tokens = data.get("max_completion_tokens", data.get("max_tokens", DEFAULT_MAX_TOKENS))
     thinking = data.get("think", True)
-    tools = utils.merge_local_tools(
+    tools = mcp_client.merge_local_tools(
         data.get("tools") or None,
         include=["local_tools"],
     )

@@ -1,5 +1,5 @@
 """
-Unit tests for parse_tool_calls in utils.py - no server or MLX required.
+Unit tests for parse_tool_calls in tool_call_parsing.py - no server or MLX required.
 
 Tests all Gemma 4 tool call format variants that the model has produced,
 including fixes applied during development to handle malformed output.
@@ -9,41 +9,19 @@ import importlib.util
 import json
 import sys
 import unittest
-from unittest.mock import MagicMock
 
 
 def _load_parse_tool_calls():
-    """Load parse_tool_calls from utils.py without triggering MLX imports."""
-    sys.modules['mlx'] = MagicMock()
-    sys.modules['mlx.utils'] = MagicMock()
-    sys.modules['mlx.core'] = MagicMock()
-    sys.modules['mlx_vlm'] = MagicMock()
-    sys.modules['mlx_vlm.sample_utils'] = MagicMock()
-    sys.modules['mlx_vlm.load'] = MagicMock()
-    sys.modules['mlx_vlm.utils'] = MagicMock()
-    sys.modules['sentence_transformers'] = MagicMock()
-    sys.modules['cachetools'] = MagicMock()
-    sys.modules['huggingface_hub'] = MagicMock()
-    sys.modules['MLXOllama.config'] = MagicMock()
-    sys.modules['MLXOllama.local_tools'] = MagicMock()
-    sys.modules['MLXOllama.local_tools.LOCAL_TOOLS'] = {}
-    sys.modules['MLXOllama.mcp_client'] = MagicMock()
-    sys.modules['MLXOllama.preemptive_queue'] = MagicMock()
-
+    """Load parse_tool_calls from tool_call_parsing.py directly, bypassing
+    MLXOllama.__init__ which imports mlx (not available in CI)."""
     spec = importlib.util.spec_from_file_location(
-        "MLXOllama.utils",
-        "MLXOllama/utils.py",
-        submodule_search_locations=[]
+        "tool_call_parsing",
+        "MLXOllama/tool_call_parsing.py",
+        submodule_search_locations=[],
     )
-
-    mock_parent = MagicMock()
-    sys.modules['MLXOllama'] = mock_parent
-
     module = importlib.util.module_from_spec(spec)
-    module.__package__ = "MLXOllama"
-    sys.modules['MLXOllama.utils'] = module
+    sys.modules["tool_call_parsing"] = module
     spec.loader.exec_module(module)
-
     return module.parse_tool_calls
 
 
@@ -303,7 +281,12 @@ class TestGemma4ArrayFormat(unittest.TestCase):
         )
 
     def test_mcp_nested_array_with_extra_braces(self):
-        """The exact failing MCP case: deeply nested objects with arrays and extra }."""
+        """The exact failing MCP case: deeply nested objects with arrays and extra }.
+
+        The LLM emits an extra ``}`` that wraps all real parameters inside an
+        outer ``arguments`` key.  The parser now detects this pattern and
+        flattens it so that ``name`` sits at the top level alongside ``arguments``.
+        """
         text = ('<|tool_call>call:HA-MCP_ha_call_write_tool'
                 '{arguments:{arguments:{config:{sequence:['
                 '{action:"light.turn_off",target:{entity_id:"light.dining_room_lights"}}},'
@@ -317,15 +300,17 @@ class TestGemma4ArrayFormat(unittest.TestCase):
         self.assertEqual(tool_calls[0]["function"]["name"], "HA-MCP_ha_call_write_tool")
         args = tool_calls[0]["function"]["arguments"]
 
-        # Verify the deeply nested structure
+        # After flattening, the top-level keys are: arguments, name
+        self.assertIn("name", args)
+        self.assertEqual(args["name"], "Day Start Script")
         self.assertIn("arguments", args)
-        inner = args["arguments"]
-        self.assertIn("arguments", inner)
-        inner2 = inner["arguments"]
-        self.assertIn("config", inner2)
-        self.assertEqual(inner2["name"], "Day Start Script")
 
-        config = inner2["config"]
+        # The nested arguments contain the real payload
+        inner = args["arguments"]
+        self.assertIn("config", inner)
+        self.assertEqual(inner["name"], "Day Start Script")
+
+        config = inner["config"]
         self.assertIn("sequence", config)
         self.assertEqual(len(config["sequence"]), 3)
 
@@ -418,6 +403,115 @@ class TestGemma4EqualsSyntaxAdvanced(unittest.TestCase):
             tool_calls[0]["function"]["arguments"],
             {"name": "test", "enabled": True, "count": 42}
         )
+
+
+class TestMisplacedBraceFlattening(unittest.TestCase):
+    """Test that misplaced-brace LLM output is correctly flattened."""
+
+    def test_log_input_ha_call_write_tool(self):
+        """The exact raw input from the production log that triggered the issue.
+
+        The LLM emits an extra ``}`` that wraps all real parameters inside an
+        outer ``arguments`` key, causing ``name`` and ``script_id`` to be
+        nested instead of at the top level.  The parser should detect and
+        flatten this pattern.
+        """
+        text = ('<|tool_call>call:ha_call_write_tool'
+                '{arguments:{name:<|"|>ha_config_set_script<|"|>,'
+                'arguments:{BestPracticeKey:<|"|>I-HAVE-READ-THE-BEST-PRACTICES-GUIDE-b422371a<|"|>,'
+                'config:{sequence:['
+                '{action:<|"|>light.turn_on<|"|>,target:{entity_id:[<|"|>light.dining_room_lights<|"|>]}}},'
+                '{action:<|"|>light.turn_on<|"|>,data:{brightness:255},'
+                'target:{entity_id:[<|"|>light.living_room_lights<|"|>]}}},'
+                '{action:<|"|>cover.close_cover<|"|>,target:{entity_id:[<|"|>cover.lrcurtains<|"|>]}}'
+                ']}}},'
+                'name:<|"|>Day Start Script<|"|>,script_id:<|"|>day_start_script<|"|>}}}'
+                '<tool_call|>')
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(tool_calls[0]["function"]["name"], "ha_call_write_tool")
+        args = tool_calls[0]["function"]["arguments"]
+
+        # After flattening, name and script_id should be at the top level
+        self.assertIn("name", args)
+        self.assertEqual(args["name"], "Day Start Script")
+        self.assertIn("script_id", args)
+        self.assertEqual(args["script_id"], "day_start_script")
+        self.assertIn("arguments", args)
+
+    def test_legitimate_single_key_not_flattened(self):
+        """A legitimate single-key argument like {data: {...}} should NOT be flattened."""
+        text = '<|tool_call>call:some_tool{data: {key1: "val1", key2: "val2"}}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"data": {"key1": "val1", "key2": "val2"}}
+        )
+
+    def test_single_key_no_nested_arguments_not_flattened(self):
+        """A single-key argument without nested 'arguments' should NOT be flattened."""
+        text = '<|tool_call>call:some_tool{arguments: {key1: "val1", key2: "val2"}}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        # No nested 'arguments' key, so no flattening
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"arguments": {"key1": "val1", "key2": "val2"}}
+        )
+
+
+class TestDuplicateKeys(unittest.TestCase):
+    """Test that duplicate JSON keys keep the first value (LLM often emits 'name' twice)."""
+
+    def test_duplicate_name_first_value_wins(self):
+        """When the LLM emits two 'name' keys, the first one should be kept.
+
+        This is the exact pattern from the production log where the LLM outputs
+        ``name:"ha_config_set_script"`` (the tool type) and then
+        ``name:"day_start"`` (the script identifier).  The first value is the
+        meaningful one for the MCP tool.
+        """
+        text = ('<|tool_call>call:ha_call_write_tool'
+                '{name:"ha_config_set_script",'
+                'arguments:{config:{alias:"Day Start",sequence:['
+                '{action:"light.turn_on",data:{brightness:255},'
+                'target:{entity_id:["light.dining_room_lights"]}}'
+                ']}},'
+                'name:"day_start"}'
+                '<tool_call|>')
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(tool_calls[0]["function"]["name"], "ha_call_write_tool")
+        args = tool_calls[0]["function"]["arguments"]
+
+        # First 'name' value should be preserved
+        self.assertEqual(args["name"], "ha_config_set_script")
+        self.assertIn("arguments", args)
+
+    def test_no_duplicate_keys_normal_behavior(self):
+        """Normal input without duplicate keys should work unchanged."""
+        text = '<|tool_call>call:some_tool{key1: "val1", key2: "val2"}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"key1": "val1", "key2": "val2"}
+        )
+
+    def test_duplicate_key_with_delimiter_format(self):
+        """Duplicate keys with <|">> delimiters should also keep first value."""
+        text = ('<|tool_call>call:some_tool'
+                '{name:<|"|>first<|"|>,value:42,'
+                'name:<|"|>second<|"|>}'
+                '<tool_call|>')
+        tool_calls, _ = parse_tool_calls(text)
+
+        args = tool_calls[0]["function"]["arguments"]
+        self.assertEqual(args["name"], "first")
+        self.assertEqual(args["value"], 42)
 
 
 class TestEdgeCases(unittest.TestCase):

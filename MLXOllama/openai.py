@@ -10,7 +10,7 @@ from typing import Any, Mapping, cast
 
 import quart
 
-from . import app, config, image_generation, utils, worker
+from . import app, config, image_generation, utils, worker, mcp_client
 from .common import images_from_messages, read_chat_request
 
 logger = logging.getLogger(__name__)
@@ -193,7 +193,7 @@ async def chat_completions() -> Any:
 
     include_local = quart.request.headers.get("X-Include-Local-Tools", "false").lower() == "true"
     if include_local:
-        tools = utils.merge_local_tools(tools)
+        tools = mcp_client.merge_local_tools(tools)
 
     if not stream:
         final_chunk: JsonObject | None = None

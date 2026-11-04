@@ -18,9 +18,10 @@ from typing import Any, cast
 from mlx_vlm import generate, stream_generate, sample_utils
 import mlx.core as mx
 
-from . import utils, config, local_tools, tts_queue, cache_utils
+from . import utils, config, local_tools, tts_queue, cache_utils, mcp_client
 from .cache_utils import get_cache
 from .common import message_text
+from .tool_call_parsing import parse_tool_calls
 from .utils import inference_worker
 
 alaskan_content = {
@@ -900,7 +901,7 @@ async def generate_stream(stream, model_info, msg_history, options,
         logging.info(f"Generated response in {time.time() - t2}")
         logging.info(f"Raw Response: {full_text}")
 
-        tool_calls,cleaned_text = utils.parse_tool_calls(full_text)
+        tool_calls,cleaned_text = parse_tool_calls(full_text)
 
         if tool_calls is None and "tool_call" in full_text:
             logging.warning(f"Tool call markers found in response but parsing returned None. Raw text: {full_text[:500]}")
@@ -1010,8 +1011,8 @@ async def try_server_tools(tool_calls: list) -> tuple[list[dict], list[dict]]:
     """
     executed = []
     to_forward = []
-    if not utils.MCP_CLIENT.available_tools:
-        await utils.MCP_CLIENT.list_tools()
+    if not mcp_client.MCP_CLIENT.available_tools:
+        await mcp_client.MCP_CLIENT.list_tools()
     for tc in tool_calls:
         fn = tc.get("function", {})
         tool_name = fn.get("name")
@@ -1033,12 +1034,12 @@ async def try_server_tools(tool_calls: list) -> tuple[list[dict], list[dict]]:
             # MCP tool — if the name isn't in the known tools list, it's likely a
             # dynamic HA-MCP tool, so prepend the HA-MCP prefix for routing.
             mcp_name = tool_name
-            if tool_name not in utils.MCP_CLIENT.available_tools and not tool_name.startswith("HA-MCP_"):
+            if tool_name not in mcp_client.MCP_CLIENT.available_tools and not tool_name.startswith("HA-MCP_"):
                 mcp_name = f"HA-MCP_{tool_name}"
                 logging.info(f"  Tool '{tool_name}' not in available_tools — trying as '{mcp_name}'")
 
             try:
-                result = await utils.MCP_CLIENT.call_tool(mcp_name, tool_args)
+                result = await mcp_client.MCP_CLIENT.call_tool(mcp_name, tool_args)
                 tool_result_content = "\n".join(
                     block.text for block in result.content
                     if hasattr(block, "text")

@@ -20,8 +20,8 @@ from mlx_vlm.apc import APCManager, DiskBlockStore
 from aiocache import cached
 from mlx_vlm.models import cache as vlm_cache
 
-from . import utils, config
-from .utils import MCP_CLIENT, inference_worker
+from . import utils, config, mcp_client
+from .utils import inference_worker
 
 static_caches = {}
 static_cache_metadata = {}
@@ -377,7 +377,7 @@ async def get_entity_ids() -> dict[str,str]:
 @cached(ttl=86400)  # 24 hours
 async def get_live_context() -> list[LiveEntity]:
     # If this throws an error, check if home assistant just changed something with the MCP naming conventions.
-    result = await MCP_CLIENT.call_tool('homeassistant_homeassistant__GetLiveContext')
+    result = await mcp_client.MCP_CLIENT.call_tool('homeassistant_homeassistant__GetLiveContext')
 
     if not result.content or not isinstance(result.content[0], TextContent):
         raise ValueError("Expected a text response from Home Assistant")
@@ -522,7 +522,7 @@ async def create_ha_cache(*_args, **_kwargs):
     model_info = utils.loaded_models[config.MAIN_MODEL]
 
     # Use the pre-computed standard tools list (MCP + local tools)
-    tools = utils.merge_local_tools(None)
+    tools = mcp_client.merge_local_tools(None)
 
     live_context = await get_live_context()
     entity_ids = await get_entity_ids()
