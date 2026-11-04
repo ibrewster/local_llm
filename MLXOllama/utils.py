@@ -337,6 +337,155 @@ OLLAMA_OPTIONS_MAP = {
 def parse_options(raw: dict) -> dict:
     return {OLLAMA_OPTIONS_MAP.get(k, k): v for k, v in (raw or {}).items()}
 
+
+def _parse_brace_value(val_str: str):
+    """Parse a single value from a brace-format argument string.
+    
+    Handles nested objects, strings, booleans, and numbers.
+    """
+    val_str = val_str.strip()
+    
+    # Nested object
+    if val_str.startswith('{') and val_str.endswith('}'):
+        inner = val_str[1:-1].strip()
+        if not inner:
+            return {}
+        nested = {}
+        # Split on commas, respecting braces and quotes
+        pairs = []
+        current = ''
+        brace_depth = 0
+        in_quote = None
+        for ch in inner:
+            if ch in ("'", '"') and in_quote is None:
+                in_quote = ch
+                current += ch
+            elif ch == in_quote:
+                in_quote = None
+                current += ch
+            elif ch == '{':
+                brace_depth += 1
+                current += ch
+            elif ch == '}':
+                brace_depth -= 1
+                current += ch
+            elif ch == ',' and in_quote is None and brace_depth == 0:
+                pairs.append(current.strip())
+                current = ''
+            else:
+                current += ch
+        if current.strip():
+            pairs.append(current.strip())
+        
+        for pair in pairs:
+            if ':' in pair:
+                key, _, val = pair.partition(':')
+                key = key.strip().strip('"').strip("'")
+                val = _parse_brace_value(val.strip())
+                nested[key] = val
+        return nested
+    
+    # Quoted string
+    if len(val_str) >= 2 and val_str[0] == val_str[-1] and val_str[0] in ("'", '"'):
+        return val_str[1:-1]
+    
+    # Boolean
+    if val_str.lower() == 'true':
+        return True
+    if val_str.lower() == 'false':
+        return False
+    
+    # Number
+    if val_str.replace('.', '', 1).replace('-', '', 1).isdigit():
+        return float(val_str) if '.' in val_str else int(val_str)
+    
+    # Plain string
+    return val_str
+
+
+def _parse_brace_args(args_str: str, func_name: str) -> Optional[Dict]:
+    """Parse brace-format arguments, handling nested objects.
+    
+    Returns a dict of arguments or None if parsing fails.
+    """
+    # Replace <|">> string delimiters
+    args_str = args_str.replace('<|"|>', '"')
+    
+    # Try standard JSON first
+    try:
+        return json.loads(args_str)
+    except json.JSONDecodeError:
+        pass
+    
+    # Quote bare keys for JSON-like syntax
+    args_str = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', args_str)
+    
+    # Try JSON again after quoting keys
+    try:
+        return json.loads(args_str)
+    except json.JSONDecodeError:
+        pass
+    
+    # Fallback: manual parsing with nested object support
+    args = {}
+    inner = args_str.strip('{}')
+    if not inner:
+        return {}
+    
+    # Split on commas, respecting braces and quotes
+    pairs = []
+    current = ''
+    brace_depth = 0
+    in_quote = None
+    for ch in inner:
+        if ch in ("'", '"') and in_quote is None:
+            in_quote = ch
+            current += ch
+        elif ch == in_quote:
+            in_quote = None
+            current += ch
+        elif ch == '{':
+            brace_depth += 1
+            current += ch
+        elif ch == '}':
+            brace_depth -= 1
+            current += ch
+        elif ch == ',' and in_quote is None and brace_depth == 0:
+            pairs.append(current.strip())
+            current = ''
+        else:
+            current += ch
+    if current.strip():
+        pairs.append(current.strip())
+    
+    for pair in pairs:
+        # Try colon separator first (JSON-like)
+        if ':' in pair:
+            key, _, val = pair.partition(':')
+            key = key.strip().strip('"').strip("'")
+            val = _parse_brace_value(val.strip())
+            args[key] = val
+        # Try = separator (key="value" syntax)
+        elif '=' in pair:
+            key, _, val = pair.partition('=')
+            key = key.strip()
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                val = val[1:-1]
+            elif val.lower() == 'true':
+                val = True
+            elif val.lower() == 'false':
+                val = False
+            elif val.replace('.', '', 1).replace('-', '', 1).isdigit():
+                val = float(val) if '.' in val else int(val)
+            args[key] = val
+    
+    if not args:
+        logging.warning(f"Gemma 4 tool call JSON parse failed for function '{func_name}': args_str='{args_str}'")
+        return None
+    return args
+
+
 def parse_tool_calls(text: str) -> tuple[Optional[List[Dict]], str]:
     """
     Parse tool calls and return both:
@@ -426,53 +575,9 @@ def parse_tool_calls(text: str) -> tuple[Optional[List[Dict]], str]:
             func_name = body[:brace_idx].strip()
             args_str = body[brace_idx:]
 
-            # Replace <|"|> string delimiters, then quote bare keys
-            args_str = args_str.replace('<|"|>', '"')
-            args_str = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', args_str)
-
-            try:
-                args = json.loads(args_str)
-            except json.JSONDecodeError:
-                # Fallback: try key="value" syntax inside braces (e.g. {query="Day Start"})
-                args = {}
-                inner = args_str.strip('{}')
-                if '=' in inner:
-                    pairs = []
-                    current = ''
-                    in_quote = None
-                    for ch in inner:
-                        if ch in ("'", '"') and in_quote is None:
-                            in_quote = ch
-                            current += ch
-                        elif ch == in_quote:
-                            in_quote = None
-                            current += ch
-                        elif ch == ',' and in_quote is None:
-                            pairs.append(current.strip())
-                            current = ''
-                        else:
-                            current += ch
-                    if current.strip():
-                        pairs.append(current.strip())
-
-                    for pair in pairs:
-                        if '=' in pair:
-                            key, _, val = pair.partition('=')
-                            key = key.strip()
-                            val = val.strip()
-                            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-                                val = val[1:-1]
-                            elif val.lower() == 'true':
-                                val = True
-                            elif val.lower() == 'false':
-                                val = False
-                            elif val.replace('.', '', 1).replace('-', '', 1).isdigit():
-                                val = float(val) if '.' in val else int(val)
-                            args[key] = val
-
-                if not args:
-                    logging.warning(f"Gemma 4 tool call JSON parse failed for function '{func_name}': args_str='{args_str}'")
-                    continue
+            args = _parse_brace_args(args_str, func_name)
+            if args is None:
+                continue
 
         # Try paren format: call:name(key='val', key2="val2")
         elif '(' in body:

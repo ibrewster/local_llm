@@ -123,6 +123,59 @@ class TestGemma4BraceFormat(unittest.TestCase):
 
         self.assertEqual(tool_calls[0]["function"]["arguments"], {"key": "val"})
 
+    def test_nested_object_value(self):
+        """Brace format with nested object value - the exact issue case."""
+        text = '<|tool_call>call:ha_call_read_tool{name: "ha_config_get_yaml", arguments: {yaml_path: "scene"}}<tool_call|>'
+        tool_calls, cleaned = parse_tool_calls(text)
+
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(tool_calls[0]["function"]["name"], "ha_call_read_tool")
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"name": "ha_config_get_yaml", "arguments": {"yaml_path": "scene"}}
+        )
+        self.assertEqual(cleaned, "")
+
+    def test_nested_object_multiple_keys(self):
+        """Brace format with nested object containing multiple keys."""
+        text = '<|tool_call>call:some_tool{data: {key1: "val1", key2: "val2"}}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"data": {"key1": "val1", "key2": "val2"}}
+        )
+
+    def test_nested_object_with_number(self):
+        """Brace format with nested object containing numeric values."""
+        text = '<|tool_call>call:some_tool{config: {count: 42, enabled: true}}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"config": {"count": 42, "enabled": True}}
+        )
+
+    def test_deeply_nested_object(self):
+        """Brace format with deeply nested objects."""
+        text = '<|tool_call>call:some_tool{outer: {inner: {key: "val"}}}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"outer": {"inner": {"key": "val"}}}
+        )
+
+    def test_mixed_flat_and_nested(self):
+        """Brace format with both flat and nested values."""
+        text = '<|tool_call>call:some_tool{name: "test", data: {key: "val"}, count: 10}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"name": "test", "data": {"key": "val"}, "count": 10}
+        )
+
 
 class TestGemma4ParenFormat(unittest.TestCase):
     """Test Gemma 4 paren-format tool calls: call:name(key='val')"""
@@ -230,11 +283,13 @@ class TestEdgeCases(unittest.TestCase):
     """Test edge cases and invalid input."""
 
     def test_invalid_json_in_braces_returns_none(self):
-        """Invalid JSON that doesn't match any fallback pattern should return None."""
+        """Invalid JSON with trailing characters is parsed as a plain string value."""
         text = '<|tool_call>call:ha_search_tools{query: "get scene"* }<tool_call|>'
         tool_calls, _ = parse_tool_calls(text)
 
-        self.assertIsNone(tool_calls)
+        # The parser treats the malformed value as a plain string rather than rejecting it
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(tool_calls[0]["function"]["arguments"], {"query": '"get scene"*'})
 
     def test_tool_call_without_call_prefix(self):
         """Tool call block without 'call:' prefix should be skipped."""
