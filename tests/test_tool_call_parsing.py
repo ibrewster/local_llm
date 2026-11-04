@@ -279,17 +279,158 @@ class TestCleanedText(unittest.TestCase):
         self.assertEqual(cleaned, text)
 
 
+class TestGemma4ArrayFormat(unittest.TestCase):
+    """Test Gemma 4 brace-format tool calls with arrays."""
+
+    def test_simple_array(self):
+        """Brace format with a simple array value."""
+        text = '<|tool_call>call:some_tool{items: ["a", "b", "c"]}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"items": ["a", "b", "c"]}
+        )
+
+    def test_array_of_objects(self):
+        """Brace format with array of objects."""
+        text = '<|tool_call>call:some_tool{items: [{name: "a"}, {name: "b"}]}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"items": [{"name": "a"}, {"name": "b"}]}
+        )
+
+    def test_mcp_nested_array_with_extra_braces(self):
+        """The exact failing MCP case: deeply nested objects with arrays and extra }."""
+        text = ('<|tool_call>call:HA-MCP_ha_call_write_tool'
+                '{arguments:{arguments:{config:{sequence:['
+                '{action:"light.turn_off",target:{entity_id:"light.dining_room_lights"}}},'
+                '{action:"light.turn_off",target:{entity_id:"light.living_room_lights"}},'
+                '{action:"switch.turn_off",target:{entity_id:"switch.lr_curtains"}}'
+                '],name:"Day Start Script"},name:"Day Start Script"}}}'
+                '<tool_call|>')
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(tool_calls[0]["function"]["name"], "HA-MCP_ha_call_write_tool")
+        args = tool_calls[0]["function"]["arguments"]
+
+        # Verify the deeply nested structure
+        self.assertIn("arguments", args)
+        inner = args["arguments"]
+        self.assertIn("arguments", inner)
+        inner2 = inner["arguments"]
+        self.assertIn("config", inner2)
+        self.assertEqual(inner2["name"], "Day Start Script")
+
+        config = inner2["config"]
+        self.assertIn("sequence", config)
+        self.assertEqual(len(config["sequence"]), 3)
+
+        # Verify first element
+        self.assertEqual(config["sequence"][0]["action"], "light.turn_off")
+        self.assertEqual(
+            config["sequence"][0]["target"]["entity_id"],
+            "light.dining_room_lights"
+        )
+
+        # Verify third element
+        self.assertEqual(config["sequence"][2]["action"], "switch.turn_off")
+        self.assertEqual(
+            config["sequence"][2]["target"]["entity_id"],
+            "switch.lr_curtains"
+        )
+
+    def test_array_with_numbers(self):
+        """Brace format with array of numbers."""
+        text = '<|tool_call>call:some_tool{values: [1, 2, 3]}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"values": [1, 2, 3]}
+        )
+
+    def test_empty_array(self):
+        """Brace format with empty array."""
+        text = '<|tool_call>call:some_tool{items: []}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"items": []}
+        )
+
+
+class TestGemma4EqualsSyntaxAdvanced(unittest.TestCase):
+    """Test advanced key="value" syntax cases not covered elsewhere."""
+
+    def test_equals_syntax_with_nested_object(self):
+        """key="value" syntax where a value is a nested object."""
+        text = '<|tool_call>call:some_tool{name="test", data: {key: "val"}}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"name": "test", "data": {"key": "val"}}
+        )
+
+    def test_equals_syntax_with_array_value(self):
+        """key="value" syntax where a value is an array."""
+        text = '<|tool_call>call:some_tool{name="test", items: ["a", "b"]}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"name": "test", "items": ["a", "b"]}
+        )
+
+    def test_missing_trailing_braces(self):
+        """LLM omits trailing closing braces — parser should still work."""
+        text = '<|tool_call>call:some_tool{key: "val"<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"key": "val"}
+        )
+
+    def test_missing_trailing_braces_nested(self):
+        """LLM omits trailing closing braces on nested objects."""
+        text = '<|tool_call>call:some_tool{data: {key: "val"}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"data": {"key": "val"}}
+        )
+
+    def test_equals_with_boolean_and_number(self):
+        """key="value" syntax mixed with boolean and numeric values."""
+        text = '<|tool_call>call:some_tool{name="test", enabled=true, count=42}<tool_call|>'
+        tool_calls, _ = parse_tool_calls(text)
+
+        self.assertEqual(
+            tool_calls[0]["function"]["arguments"],
+            {"name": "test", "enabled": True, "count": 42}
+        )
+
+
 class TestEdgeCases(unittest.TestCase):
     """Test edge cases and invalid input."""
 
     def test_invalid_json_in_braces_returns_none(self):
-        """Invalid JSON with trailing characters is parsed as a plain string value."""
+        """Invalid JSON with trailing characters — parser extracts the quoted string."""
         text = '<|tool_call>call:ha_search_tools{query: "get scene"* }<tool_call|>'
         tool_calls, _ = parse_tool_calls(text)
 
-        # The parser treats the malformed value as a plain string rather than rejecting it
+        # The parser extracts the valid quoted string, ignoring trailing *
         self.assertIsNotNone(tool_calls)
-        self.assertEqual(tool_calls[0]["function"]["arguments"], {"query": '"get scene"*'})
+        self.assertEqual(tool_calls[0]["function"]["arguments"], {"query": "get scene"})
 
     def test_tool_call_without_call_prefix(self):
         """Tool call block without 'call:' prefix should be skipped."""
