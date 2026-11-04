@@ -432,9 +432,47 @@ def parse_tool_calls(text: str) -> tuple[Optional[List[Dict]], str]:
 
             try:
                 args = json.loads(args_str)
-            except json.JSONDecodeError as e:
-                logging.warning(f"Gemma 4 tool call JSON parse failed for function '{func_name}': args_str='{args_str}' error={e}")
-                continue
+            except json.JSONDecodeError:
+                # Fallback: try key="value" syntax inside braces (e.g. {query="Day Start"})
+                args = {}
+                inner = args_str.strip('{}')
+                if '=' in inner:
+                    pairs = []
+                    current = ''
+                    in_quote = None
+                    for ch in inner:
+                        if ch in ("'", '"') and in_quote is None:
+                            in_quote = ch
+                            current += ch
+                        elif ch == in_quote:
+                            in_quote = None
+                            current += ch
+                        elif ch == ',' and in_quote is None:
+                            pairs.append(current.strip())
+                            current = ''
+                        else:
+                            current += ch
+                    if current.strip():
+                        pairs.append(current.strip())
+
+                    for pair in pairs:
+                        if '=' in pair:
+                            key, _, val = pair.partition('=')
+                            key = key.strip()
+                            val = val.strip()
+                            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                                val = val[1:-1]
+                            elif val.lower() == 'true':
+                                val = True
+                            elif val.lower() == 'false':
+                                val = False
+                            elif val.replace('.', '', 1).replace('-', '', 1).isdigit():
+                                val = float(val) if '.' in val else int(val)
+                            args[key] = val
+
+                if not args:
+                    logging.warning(f"Gemma 4 tool call JSON parse failed for function '{func_name}': args_str='{args_str}'")
+                    continue
 
         # Try paren format: call:name(key='val', key2="val2")
         elif '(' in body:
