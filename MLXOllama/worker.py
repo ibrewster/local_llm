@@ -902,6 +902,9 @@ async def generate_stream(stream, model_info, msg_history, options,
 
         tool_calls,cleaned_text = utils.parse_tool_calls(full_text)
 
+        if tool_calls is None and "tool_call" in full_text:
+            logging.warning(f"Tool call markers found in response but parsing returned None. Raw text: {full_text[:500]}")
+
         if not tool_calls or is_gen:
             break
         
@@ -1001,64 +1004,61 @@ async def try_server_tools(tool_calls: list) -> tuple[list[dict], list[dict]]:
 
     Returns:
         executed: list of {"role": "tool", "content": ...} messages for calls that were executed
-                  (successful result or tool-reported error via MCP)
+                  (successful result, tool-reported error, or execution failure)
         to_forward: list of original tool_call dicts that could not be executed here
-                    (local function crash, unknown tool name on MCP, connection failures, etc.)
+                    (unknown tool name only)
     """
     executed = []
     to_forward = []
     if not utils.MCP_CLIENT.available_tools:
         await utils.MCP_CLIENT.list_tools()
-    server_tools = utils.MCP_CLIENT.available_tools | local_tools.LOCAL_TOOLS.keys()
     for tc in tool_calls:
         fn = tc.get("function", {})
         tool_name = fn.get("name")
         tool_args = fn.get("arguments", {})
-        exec_success = False
         tool_result_content = None
-        if tool_name not in server_tools:
-            to_forward.append(tc)
-            continue
 
         if tool_name in local_tools.LOCAL_TOOLS:
             try:
                 func = getattr(local_tools, tool_name)
                 tool_result_content = await func(**tool_args)
-                exec_success = True
             except Exception as local_exc:
                 logging.error(f"Local execution of {tool_name} failed.")
                 traceback.print_exc()
-                tool_result_content = json.dumps({
-                    'result': 'ERROR',
-                    'content': f"Execution of {tool_name} failed: {local_exc}",
-                })
+                tool_result_content = (
+                    f"ERROR: The tool '{tool_name}' failed with an error: {local_exc}\n"
+                    f"Please try a different approach or correct your arguments and try again."
+                )
         else:
+            # MCP tool — if the name isn't in the known tools list, it's likely a
+            # dynamic HA-MCP tool, so prepend the HA-MCP prefix for routing.
+            mcp_name = tool_name
+            if tool_name not in utils.MCP_CLIENT.available_tools:
+                mcp_name = f"HA-MCP_{tool_name}"
+                logging.info(f"  Tool '{tool_name}' not in available_tools — trying as '{mcp_name}'")
+
             try:
-                result = await utils.MCP_CLIENT.call_tool(tool_name, tool_args)
+                result = await utils.MCP_CLIENT.call_tool(mcp_name, tool_args)
                 tool_result_content = "\n".join(
                     block.text for block in result.content
                     if hasattr(block, "text")
                 )
-                exec_success = True
 
                 if result.is_error:
-                    # do NOT set exc_success to False here - the tool
-                    # *did* run, it just returned an error result.
-                    logging.error(f"Tool {tool_name} returned error: {tool_result_content}")
+                    logging.error(f"Tool {mcp_name} returned error: {tool_result_content}")
 
             except Exception as e:
-                # Can't handle locally. Fall back to sending to the caller.
-                logging.error(f"MCP tool call failed: {e}")
+                # Transport failure — forward to the client (e.g., Open WebUI may
+                # provide the tool) rather than returning an error to the LLM.
+                logging.warning(f"MCP tool call failed for '{mcp_name}': {e} — forwarding to client")
+                to_forward.append(tc)
+                continue
 
-        if exec_success:
-            executed.append({
-                "role": "tool",
-                "content": tool_result_content or "",
-                "tool_call_id": tc.get("id"),
-                # "name": name,
-            })
-        else:
-            # Either never got a result, or got an error from MCP
-            to_forward.append(tc)
+        executed.append({
+            "role": "tool",
+            "content": tool_result_content or "",
+            "tool_call_id": tc.get("id"),
+            # "name": name,
+        })
 
     return executed, to_forward

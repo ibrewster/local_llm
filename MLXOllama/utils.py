@@ -135,6 +135,9 @@ MCP_CLIENT_CONFIG = {
                 "Authorization": f"Bearer {config.HA_TOKEN}"
             }
         },
+        "HA-MCP": {
+            "url": "http://10.27.81.207:9584/private_Mj4Aa5j0ba8NrDJJliaohw",
+        },
         "web_fetch": {
             "command": "uvx",
             "args": ["mcp-server-fetch"]
@@ -421,7 +424,8 @@ def parse_tool_calls(text: str) -> tuple[Optional[List[Dict]], str]:
 
         try:
             args = json.loads(args_str)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            logging.warning(f"Gemma 4 tool call JSON parse failed for function '{func_name}': args_str='{args_str}' error={e}")
             continue
 
         if func_name:

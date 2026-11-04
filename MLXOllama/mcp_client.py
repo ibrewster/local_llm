@@ -32,12 +32,12 @@ class MCPService:
     async def call_tool(self, tool_name, tool_args=None):
         try:
             client = await self.get_client()
-            return await client.call_tool(tool_name, tool_args)
+            return await client.call_tool(tool_name, tool_args, raise_on_error=False)
         except (MCPError, ClientError, ConnectionError, BrokenPipeError):
             # If server restarted or connection dropped, reset and retry once
             await self.reset()
             client = await self.get_client()
-            return await client.call_tool(tool_name, tool_args)
+            return await client.call_tool(tool_name, tool_args, raise_on_error=False)
 
     async def list_tools(self):
         client = await self.get_client()
