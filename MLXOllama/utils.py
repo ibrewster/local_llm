@@ -399,33 +399,89 @@ def parse_tool_calls(text: str) -> tuple[Optional[List[Dict]], str]:
     # ────────────────────────────────────────────────
     # Gemma 4 native format
     # <|tool_call>call:name{key:<|"|>val<|"|>}<tool_call|>
+    # Also supports: <|tool_call>call:name(key='val')<tool_call|>
+    # Also accept malformed closing tags like <toolcall|> (missing underscore)
     # ────────────────────────────────────────────────
-    gemma4_pattern = r'<\|tool_call>(.*?)<tool_call\|>'
+    gemma4_pattern = r'<\|tool_call>(.*?)(?:<tool_call\|>|<toolcall\|>)'
     gemma4_blocks = re.findall(gemma4_pattern, text, re.DOTALL)
 
     for block in gemma4_blocks:
+        # Try both closing tag variants for removal from cleaned text
         block_full = f'<|tool_call>{block}<tool_call|>'
-        cleaned_text = cleaned_text.replace(block_full, '', 1).strip()
+        if block_full in cleaned_text:
+            cleaned_text = cleaned_text.replace(block_full, '', 1).strip()
+        else:
+            # Malformed closing tag (e.g. <toolcall|> without underscore)
+            block_full_alt = f'<|tool_call>{block}<toolcall|>'
+            cleaned_text = cleaned_text.replace(block_full_alt, '', 1).strip()
 
         body = block.strip()
         if not body.startswith('call:'):
             continue
         body = body[len('call:'):]
 
+        # Try brace format first: call:name{...}
         brace_idx = body.find('{')
-        if brace_idx == -1:
-            continue
-        func_name = body[:brace_idx].strip()
-        args_str = body[brace_idx:]
+        if brace_idx != -1:
+            func_name = body[:brace_idx].strip()
+            args_str = body[brace_idx:]
 
-        # Replace <|"|> string delimiters, then quote bare keys
-        args_str = args_str.replace('<|"|>', '"')
-        args_str = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', args_str)
+            # Replace <|"|> string delimiters, then quote bare keys
+            args_str = args_str.replace('<|"|>', '"')
+            args_str = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', args_str)
 
-        try:
-            args = json.loads(args_str)
-        except json.JSONDecodeError as e:
-            logging.warning(f"Gemma 4 tool call JSON parse failed for function '{func_name}': args_str='{args_str}' error={e}")
+            try:
+                args = json.loads(args_str)
+            except json.JSONDecodeError as e:
+                logging.warning(f"Gemma 4 tool call JSON parse failed for function '{func_name}': args_str='{args_str}' error={e}")
+                continue
+
+        # Try paren format: call:name(key='val', key2="val2")
+        elif '(' in body:
+            paren_idx = body.find('(')
+            func_name = body[:paren_idx].strip()
+            args_str = body[paren_idx + 1:].rstrip(')').strip()
+
+            # Parse Python-style keyword arguments
+            args = {}
+            if args_str:
+                # Split on commas, but respect quoted strings
+                pairs = []
+                current = ''
+                in_quote = None
+                for ch in args_str:
+                    if ch in ("'", '"') and in_quote is None:
+                        in_quote = ch
+                        current += ch
+                    elif ch == in_quote:
+                        in_quote = None
+                        current += ch
+                    elif ch == ',' and in_quote is None:
+                        pairs.append(current.strip())
+                        current = ''
+                    else:
+                        current += ch
+                if current.strip():
+                    pairs.append(current.strip())
+
+                for pair in pairs:
+                    if '=' in pair:
+                        key, _, val = pair.partition('=')
+                        key = key.strip()
+                        val = val.strip()
+                        # Remove surrounding quotes
+                        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                            val = val[1:-1]
+                        # Try to convert numeric values
+                        elif val.lower() == 'true':
+                            val = True
+                        elif val.lower() == 'false':
+                            val = False
+                        elif val.replace('.', '', 1).replace('-', '', 1).isdigit():
+                            val = float(val) if '.' in val else int(val)
+                        args[key] = val
+
+        else:
             continue
 
         if func_name:
