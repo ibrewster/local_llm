@@ -1,4 +1,5 @@
 import asyncio
+import fnmatch
 import logging
 from typing import List, Dict, Optional
 
@@ -89,13 +90,26 @@ SKIPPED_MCP_TOOLS = {
     'homeassistant_GetLiveContext',
     'MCPAssist_perform_action',
     'homeassistant_HassMediaSearchAndPlay',
-    'homeassistant_HassMediaPause'
+    'homeassistant_HassMediaPause',
+    # Wildcard patterns (using glob syntax) to exclude entire tool groups
+    'HA-MCP_*',
 }
 
 
 # ---------------------------------------------------------------------------
 # Tool management
 # ---------------------------------------------------------------------------
+
+def _tool_should_skip(tool_name: str) -> bool:
+    """Check if a tool name matches any skip pattern.
+    
+    Supports both exact matches and glob-style wildcards (e.g., 'HA-MCP_*').
+    """
+    for pattern in SKIPPED_MCP_TOOLS:
+        if fnmatch.fnmatch(tool_name, pattern):
+            return True
+    return False
+
 
 async def build_standard_mcp_tools() -> List[Dict]:
     """Fetch and transform MCP tools into OpenAI-compatible format.
@@ -115,7 +129,7 @@ async def build_standard_mcp_tools() -> List[Dict]:
             },
         }
         for tool in raw
-        if tool.name not in SKIPPED_MCP_TOOLS
+        if not _tool_should_skip(tool.name)
     ]
 
 

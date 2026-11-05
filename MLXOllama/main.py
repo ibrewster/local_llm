@@ -9,9 +9,27 @@ import quart
 import sounddevice as sd
 import soundfile as sf
 
-from . import app, speak_queue, config, utils, worker, cache_utils, mcp_client
+from . import app, speak_queue, tts_queue, config, utils, worker, cache_utils, mcp_client
 from .common import images_from_messages, message_text, read_chat_request
 assert app is not None #because we couldn't be here if it was
+
+
+@app.route("/speak", methods=["POST"])
+async def speak_direct():
+    """Send text directly to TTS, bypassing the LLM."""
+    data = await quart.request.get_json() or {}
+    text = data.get("text")
+
+    if not text or not isinstance(text, str) or not text.strip():
+        return quart.jsonify({"error": "text is required"}), 400
+
+    speed = data.get("speed", 1.1)
+    voice = data.get("voice", "af_sarah")
+
+    tts_queue.put((text.strip(), speed, voice))
+    tts_queue.put("__FLUSH__")
+
+    return quart.jsonify({"status": "speaking"}), 202
 
 
 @app.route("/playGoodnight", methods=["POST"])

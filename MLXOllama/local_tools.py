@@ -1299,3 +1299,72 @@ async def play_artist(artist_name: str, shuffle: bool = True):
         response = await client.put(f"{ITUNES_URL}/library/artists/{safe_artist}/play")
         response.raise_for_status()
         return response.text
+
+
+@local_tool
+async def ha_mcp_search_tools(query: str) -> str:
+    """Search the HA-MCP server for tools matching a query. Use this tool to discover
+    what HA-MCP tools are available when no standard homeassistant_ tool can fulfill a request.
+    Returns a compact list of matching tool names and descriptions so you can decide which
+    HA-MCP tool to call next. Only call this when you have exhausted the standard tools.
+
+    PARAMETERS
+    ----------
+    query (str): Search term to match against tool names and descriptions (e.g., 'backup', 'camera', 'automation').
+
+    RETURNS
+    -------
+    A JSON array of matching tools with name, description, and parameter count.
+    """
+    from . import mcp_client
+    from rapidfuzz import process, fuzz
+
+    # Fetch the full tool list from HA-MCP server
+    try:
+        raw_tools = await mcp_client.MCP_CLIENT.list_tools()
+    except Exception as e:
+        return json.dumps({"error": f"Failed to list HA-MCP tools: {str(e)}"})
+
+    # Filter to HA-MCP tools only (prefixed with HA-MCP_)
+    ha_mcp_tools = [t for t in raw_tools if t.name.startswith("HA-MCP_")]
+    if not ha_mcp_tools:
+        return json.dumps({"error": "No HA-MCP tools available"})
+
+    # Build search corpus: (name, description) tuples
+    corpus = []
+    for tool in ha_mcp_tools:
+        text = f"{tool.name}: {tool.description or ''}"
+        corpus.append(text)
+
+    # Search using fuzzy matching
+    matches = process.extract(
+        query,
+        corpus,
+        scorer=fuzz.TokenSortRatio,
+        limit=10,
+    )
+
+    # Format results
+    results = []
+    for matched_text, score, _ in matches:
+        if score < 30:
+            break
+        # Parse name and description from matched text
+        if ": " in matched_text:
+            name, _, description = matched_text.partition(": ")
+        else:
+            name = matched_text
+            description = ""
+
+        # Find the tool to get parameter count
+        tool = next((t for t in ha_mcp_tools if t.name == name), None)
+        param_count = len(tool.input_schema.get("properties", {})) if tool else 0
+
+        results.append({
+            "name": name,
+            "description": description.strip(),
+            "params": param_count,
+            "score": round(score),
+        })
+
+    return json.dumps(results)
