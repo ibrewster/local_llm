@@ -299,6 +299,7 @@ class LiveEntity:
     state: str
     areas: list[str] = field(default_factory=list)
     attributes: dict = field(default_factory=dict)
+    device: str | None = None
 
 
 async def get_rest_data() -> list[dict]:
@@ -382,7 +383,11 @@ async def get_live_context() -> list[LiveEntity]:
     if not result.content or not isinstance(result.content[0], TextContent):
         raise ValueError("Expected a text response from Home Assistant")
 
-    payload = json.loads(result.content[0].text)
+    text = result.content[0].text
+    if not text or not text.strip():
+        raise ValueError("Home Assistant MCP returned an empty response for GetLiveContext")
+
+    payload = json.loads(text)
     exposed_entities: str = payload["result"]
     exposed_entities = re.sub(r"^Live Context:.*?\n", "", exposed_entities, flags=re.DOTALL).strip()
 
@@ -424,7 +429,75 @@ def _build_entity(raw: dict) -> LiveEntity:
         state=raw.get("state", ""),
         areas=areas,
         attributes=raw.get("attributes", {}),
+        device=raw.get("device"),
     )
+
+
+def match_entity_id(
+    names: list[str],
+    entity_ids: dict[str, str],
+    device_name: str | None = None,
+) -> str | None:
+    """Match a live context entity's names to an entity_id from the REST API.
+
+    Home Assistant 2026.11 composes friendly_name as ``deviceName + " " + entityName``
+    (e.g., "Chillguard Outside Temperature"), while the MCP GetLiveContext reports only
+    the entity name (e.g., "Outside Temperature").  This function tries a cascade of
+    strategies to find the correct entity_id.
+
+    Args:
+        names: List of display names from the MCP live context (e.g.,
+               ["Outside Temperature", "Back Yard Temperature"]).
+        entity_ids: Mapping of lowercased friendly_name → entity_id from the REST API.
+        device_name: Optional device name from the MCP live context (e.g., "Chillguard").
+                     When provided, enables a device-prefix match strategy.
+
+    Returns:
+        The matched entity_id, or ``None`` if no strategy succeeded.
+
+    Matching strategies (in priority order):
+        1. **Exact match** — MCP name equals friendly_name (case-insensitive).
+        2. **Device prefix match** (if device_name provided) — friendly_name starts with
+           ``deviceName + " " + MCP name``.
+        3. **Suffix match** — friendly_name ends with ``" " + MCP name``, handling the
+           HA 2026.11 ``deviceName + " " + entityName`` pattern.
+        4. **Substring fallback** — MCP name is contained anywhere in the friendly_name,
+           for legacy or non-standard naming.
+    """
+    for name in names:
+        name_lower = name.lower()
+
+        # 1. Exact match
+        if entity_id := entity_ids.get(name_lower):
+            return entity_id
+
+        # 2. Device prefix match (most precise for HA 2026.11)
+        if device_name is not None:
+            device_prefix = (device_name + " " + name).lower()
+            if entity_id := entity_ids.get(device_prefix):
+                return entity_id
+
+        # 3. Suffix match — friendly_name ends with the MCP name
+        candidates = [
+            (fn, eid)
+            for fn, eid in entity_ids.items()
+            if fn.endswith(" " + name_lower)
+        ]
+        if candidates:
+            candidates.sort(key=lambda x: len(x[0]))
+            return candidates[0][1]
+
+        # 4. Last resort: generic substring match
+        candidates = [
+            (fn, eid)
+            for fn, eid in entity_ids.items()
+            if name_lower in fn
+        ]
+        if candidates:
+            candidates.sort(key=lambda x: len(x[0]))
+            return candidates[0][1]
+
+    return None
 
 
 async def cache_refresh_loop():
@@ -530,18 +603,17 @@ async def create_ha_cache(*_args, **_kwargs):
     lines: list[str] = []
 
     for entity in live_context:
-        for name in entity.names:
-            if entity_id := entity_ids.get(name.lower()):
-                # Using YAML-style structure for maximum Qwen compatibility
-                entry = [
-                    f"- names: {', '.join(entity.names)}",
-                    f"  domain: {entity.domain}",
-                    f"  entity_id: {entity_id}",
-                ]
-                if entity.areas:
-                    entry.append(f"  areas: {', '.join(entity.areas)}")
-                lines.append("\n".join(entry))
-                break
+        matched_entity_id = match_entity_id(entity.names, entity_ids, entity.device)
+        if matched_entity_id is not None:
+            # Using YAML-style structure for maximum Qwen compatibility
+            entry = [
+                f"- names: {', '.join(entity.names)}",
+                f"  domain: {entity.domain}",
+                f"  entity_id: {matched_entity_id}",
+            ]
+            if entity.areas:
+                entry.append(f"  areas: {', '.join(entity.areas)}")
+            lines.append("\n".join(entry))
 
     entities = "\n".join(lines)
     system_prompt = (Path(__file__).parent / "Prompts" / "HA_system.txt").read_text()

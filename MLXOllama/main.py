@@ -23,8 +23,9 @@ async def speak_direct():
     if not text or not isinstance(text, str) or not text.strip():
         return quart.jsonify({"error": "text is required"}), 400
 
-    speed = data.get("speed", 1.1)
-    voice = data.get("voice", "af_sarah")
+    speed = data.get("speed") or 0.9
+    speed=float(speed)
+    voice = data.get("voice") or "am_liam"
 
     tts_queue.put((text.strip(), speed, voice))
     tts_queue.put("__FLUSH__")
@@ -55,7 +56,9 @@ async def generate_response():
     payload = await quart.request.json
     prompt = payload['prompt']
     system = payload.get("system", "")
-    speak_queue.put((system, prompt))
+    speed = payload.get("speed", 1.1)
+    voice = payload.get("voice", "af_sarah")
+    speak_queue.put((system, prompt, speed, voice))
     return "Accepted", 202
 
 @app.route('/generate/cache_news', methods=['POST'])

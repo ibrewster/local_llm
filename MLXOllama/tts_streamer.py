@@ -32,8 +32,11 @@ class TTSStreamer(spawn_context.Process):
         # self._audio_model = load_model("mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-6bit")
         
         dummy = "Warming up."
-        for _ in self._audio_model.generate(dummy, voice='af_sarah', lang="a", speed=1.0, stream=True):
-            pass  # consume and discard
+        try:
+            for _ in self._audio_model.generate(dummy, voice='af_sarah', lang="a", speed=1.0, stream=True):
+                pass  # consume and discard
+        except RuntimeError as e:
+            logging.error(f"TTS warm-up failed: {e}")
         
         logging.info("TTS Streamer process running")
         try:
@@ -71,17 +74,20 @@ class TTSStreamer(spawn_context.Process):
             data = data.replace(old, new)
 
         t0 = time.time()
-        for chunk in self._audio_model.generate(data, voice=voice, lang="a", speed=speed, stream=True):
-            logging.info(f"Streamed sentence after {time.time() - t0} (length: {len(data)})")
-            audio = chunk.audio
-            rms = mx.sqrt(mx.mean(audio**2))
-            curr_db = 20 * numpy.log10(rms) if rms > 0 else -100
-            gain = 10**((-12 - curr_db) / 20)
-            normalized_mx = mx.tanh(audio * gain)
-            # normalized_mx = mx.tanh(chunk.audio * self.TARGET_GAIN)
-            audio_np = numpy.array(normalized_mx).astype(numpy.float32)
-            ####### DEBUG REMOVE #######
-            # logging.info(data)
-            # continue
-            ##################
-            self._packetizer.push(audio_np)
+        try:
+            for chunk in self._audio_model.generate(data, voice=voice, lang="a", speed=speed, stream=True):
+                logging.info(f"Streamed sentence after {time.time() - t0} (length: {len(data)})")
+                audio = chunk.audio
+                rms = mx.sqrt(mx.mean(audio**2))
+                curr_db = 20 * numpy.log10(rms) if rms > 0 else -100
+                gain = 10**((-12 - curr_db) / 20)
+                normalized_mx = mx.tanh(audio * gain)
+                # normalized_mx = mx.tanh(chunk.audio * self.TARGET_GAIN)
+                audio_np = numpy.array(normalized_mx).astype(numpy.float32)
+                ####### DEBUG REMOVE #######
+                # logging.info(data)
+                # continue
+                ##################
+                self._packetizer.push(audio_np)
+        except RuntimeError as e:
+            logging.error(f"TTS generation failed for voice '{voice}': {e}")

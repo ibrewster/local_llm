@@ -270,14 +270,20 @@ def speak_thread(speak_queue):
             try:
                 msg = speak_queue.get(timeout=300) # 5 minutes
             except queue.Empty:
-                run_dummy_inference()
+                if not inference_worker.pending_count():
+                    run_dummy_inference()
                 continue
 
             if isinstance(msg, tuple):
-                system, prompt = msg
+                if len(msg) == 4:
+                    system, prompt, speed, voice = msg
+                else:
+                    system, prompt = msg
+                    speed, voice = 1.1, "af_sarah"
             else:
                 system: str|None = None
                 prompt: str = msg
+                speed, voice = 1.1, "af_sarah"
 
             if prompt == "QUIT":
                 break
@@ -366,14 +372,14 @@ def speak_thread(speak_queue):
                             logging.info(f"Time to first sentence: {time.time()-t1}")
                         sentence_count += 1
                         logging.debug(complete.strip())
-                        tts_queue.put(complete.strip())
+                        tts_queue.put((complete.strip(), speed, voice))
 
                     if is_done: # failsafe, but we shouldn't get here.
                         break
 
                 # Flush remaining text
                 if buffer:
-                    tts_queue.put(buffer)
+                    tts_queue.put((buffer, speed, voice))
             finally:
                 tts_queue.put("__FLUSH__")
                 logging.info(f"Completed inference in {time.time() - t1}")
